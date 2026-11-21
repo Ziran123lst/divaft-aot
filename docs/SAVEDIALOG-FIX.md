@@ -74,3 +74,47 @@ STUB import: en7gNVnh878#S#T (sceSaveDataDialogIsReadyToDisplay) arg0=0x3e80
 - 本地无真机,无法在沙箱内验证运行;需真机日志闭环。
 - 若此自动应答不能让存档流程正常,下一步(路线 B)是复刻 ImeDialog 的
   `BB_IME_FILE` 文件桥接,由 Android launcher 弹出原生存档选择 UI。
+
+---
+
+## v1.1 真机验证结果(2026-11-21)
+
+v1.1 的 dialog 补丁**成功**:新日志里出现
+`SaveDataDialog GetResult -> mode=1 disp=1 slot=SAVEDATA00 (auto)`,
+游戏拿着结果去 `save data 'SAVEDATA00' mounted at /savedata0 (created)`。
+`bbpresent-diag.log` 从 v1.0 的满屏 `DROP: sc=0x0`(黑屏)变成
+`frame 1 SHOW ... frame 1140 SHOW`,**画面正常渲染,黑屏解决**。
+
+但游戏继续往前走后触发了新的底层阻塞:
+
+```
+STUB import: j8xKtiFj0SY#T#U (sceSaveDataGetEventResult) arg0=0x0
+STOP: AOT: native code is missing an entry at +0xa97d5
+```
+
+- 前者:`sceSaveDataGetEventResult` 未实现(STUB 返回 0,不致命)。
+- 后者:**AOT 严格模式 miss**——guest 地址 `+0xa97d5` 没有对应的 native 入口,停机。
+  这是全 AOT(无解释器/JIT 回退)的固有问题,不是 dialog 修复引入的,
+  只是修复后游戏第一次走到这个未编译的分支。
+
+## v1.2 修复(两项)
+
+1. **AOT 补入口**:用 `bb-recomp --extra-entries`(地址 `0xa97d5`)重编 libbbaot.so。
+   - 新库 units `57133 → 57134`(正好补了这一个入口),image hash 匹配。
+   - 这是 `--extra-entries` 的标准 miss-log 循环:若后续还有新 miss,重复此步。
+2. **补 `sceSaveDataGetEventResult`**:返回 `ERR_NOT_FOUND`(0x809F0008,无挂起事件),
+   消除存档流程里的这个 STUB。
+
+产物 `DIVA-Launcher-v1.2-SaveAOT.apk`:同时替换了 libbbaot.so 与 libbbprobe.so,
+AHB 驱动保持不变,签名一致可覆盖安装。
+
+## 验证方法(v1.2)
+
+覆盖安装后进入存档页,抓新 `diva-boot.log`:
+- 不应再有 `native code is missing an entry at +0xa97d5`
+- 不应再有 `STUB import: sceSaveDataGetEventResult`
+- 存档菜单应能正常交互(选槽/新建/读取)
+
+若出现**新的** `+0x.....` 地址 miss:说明还有未覆盖的间接跳转落点,
+把该地址发我,用同样的 `--extra-entries` 再补一次即可(每次真机跑会暴露一个)。
+若 miss 地址反复出现在同一处且补后无效,需检查 extra-entries 是否被正确解析。

@@ -357,6 +357,11 @@ static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write)
 }
 static ABI int32_t memory_get(int32_t user, void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io(buffer,size,offset,0); }
 static ABI int32_t memory_set(int32_t user, void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io(buffer,size,offset,1); }
+/* Asynchronous save events (backup/restore) are never generated offline.  The game
+ * polls this after a mount; report "no event pending" (shadPS4: Error::NOT_FOUND). */
+static ABI int32_t save_get_event_result(const void *param, void *event) {
+    (void)param; (void)event; return ERR_NOT_FOUND; /* 0x809F0008 */
+}
 
 static const RuntimeExport exports[]={
     {"sceSaveDataInitialize",save_initialize}, {"sceSaveDataInitialize2",save_initialize},
@@ -366,6 +371,7 @@ static const RuntimeExport exports[]={
     {"sceSaveDataDirNameSearch",save_search},
     {"sceSaveDataSetupSaveDataMemory",memory_setup}, {"sceSaveDataGetSaveDataMemory",memory_get},
     {"sceSaveDataSetSaveDataMemory",memory_set},
+    {"sceSaveDataGetEventResult",save_get_event_result},
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
