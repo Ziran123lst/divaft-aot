@@ -210,8 +210,9 @@ DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
  * This offline runtime has no ImGui frontend, so the UI is rendered by the Android
  * launcher (DisplayActivity) and talks to us through a tiny file bridge, the same
  * pattern the virtual pad (BB_PAD_FILE) uses.  Protocol, all files in $BB_SAVEDLG_DIR:
- *   request  : "MODE DISPTYPE SLOT,SLOT,...\n"  written by us on Open
- *   response : "SLOTNAME" | "CANCEL" | "NEW"   written by the app when the player picks
+ *   request  : "SEQ MODE DISPTYPE SLOT;SLOT;...\n"  written by us on Open (SEQ increments)
+ *   response : "SEQ SLOTNAME" | "SEQ CANCEL" | "SEQ NEW"  written by the app; SEQ must match,
+ *              and the app deletes `request` as soon as it consumes it, so a dialog is shown once.
  * GetResult polls for `response` (bounded by BB_SAVEDLG_TIMEOUT, default 300 s).
  * If the bridge is unavailable or times out we fall back to a legal auto-answer
  * (SAVEDATA00) so the game never hangs.  The game's own load/save menu
@@ -237,6 +238,7 @@ typedef struct {
 static uint32_t sdlg_mode=1, sdlg_disp=2;
 static char sdlg_chosen[64]="SAVEDATA00";
 static int  sdlg_interactive=0;
+static unsigned long sdlg_seq=0; /* monotonic request id; response must echo it */
 
 /* Directory holding the dialog bridge files. Empty => bridge disabled (auto-answer). */
 static const char *savedlg_dir(void) {
@@ -311,13 +313,15 @@ static ABI int32_t save_open(const SdlgParam *p) {
         unlink(resp); /* stale result from a previous dialog must not be reused */
         char slots[768];
         savedlg_scan_slots(slots,sizeof(slots));
+        unlink(req); /* drop any stale request the app did not consume */
+        sdlg_seq++;
         FILE *f=fopen(req,"w");
         if (f) {
-            fprintf(f,"%u %u %s\n",sdlg_mode,sdlg_disp,slots);
+            fprintf(f,"%lu %u %u %s\n",sdlg_seq,sdlg_mode,sdlg_disp,slots);
             fclose(f);
             sdlg_interactive=1;
-            printf("Runtime: SaveDataDialog request posted (mode=%u disp=%u slots=[%s])\n",
-                   sdlg_mode,sdlg_disp,slots);
+            printf("Runtime: SaveDataDialog request posted seq=%lu (mode=%u disp=%u slots=[%s])\n",
+                   sdlg_seq,sdlg_mode,sdlg_disp,slots);
             dialogs[2].status=2; /* RUNNING: wait for the app's selection */
             return 0;
         }
@@ -338,27 +342,37 @@ static ABI int32_t save_get_result(SdlgResult *r) {
         const char *t=getenv("BB_SAVEDLG_TIMEOUT");
         if (t && t[0]) timeout=(unsigned)strtoul(t,NULL,10);
         unsigned waited=0;
-        FILE *f=NULL;
-        while (waited<timeout) {
-            f=fopen(resp,"r");
-            if (f) break;
-            usleep(100000); /* 100 ms */
-            waited++;
-        }
-        if (f) {
-            char line[128]={0};
-            if (fgets(line,sizeof(line),f)) {
-                line[strcspn(line,"\r\n")]=0;
-                if (!strcmp(line,"CANCEL")) { cancelled=1; }
-                else if (!strcmp(line,"NEW")) { snprintf(chosen,sizeof(chosen),"SAVEDATA00"); }
-                else if (line[0] && strlen(line)<sizeof(chosen)) { snprintf(chosen,sizeof(chosen),"%s",line); }
+        int got=0;
+        while (waited<timeout && !got) {
+            FILE *f=fopen(resp,"r");
+            if (f) {
+                char line[128]={0};
+                if (fgets(line,sizeof(line),f)) {
+                    line[strcspn(line,"\r\n")]=0;
+                    unsigned long rseq=strtoul(line,NULL,10);
+                    const char *val=line;
+                    while (*val && *val!=' ' && *val!='\t') val++;
+                    while (*val==' ' || *val=='\t') val++;
+                    if (rseq==sdlg_seq && *val) {
+                        got=1;
+                        if (!strcmp(val,"CANCEL")) cancelled=1;
+                        else if (!strcmp(val,"NEW")) snprintf(chosen,sizeof(chosen),"SAVEDATA00");
+                        else if (strlen(val)<sizeof(chosen)) snprintf(chosen,sizeof(chosen),"%s",val);
+                        printf("Runtime: SaveDataDialog selection seq=%lu -> [%s]%s\n",
+                               rseq,chosen,cancelled?" (CANCEL)":"");
+                    } else {
+                        printf("Runtime: SaveDataDialog ignoring stale response (seq=%lu want=%lu)\n",rseq,sdlg_seq);
+                    }
+                }
+                fclose(f);
+                unlink(resp); /* consume this response either way */
+                if (!got) { usleep(100000); waited++; }
+            } else {
+                usleep(100000); /* 100 ms */
+                waited++;
             }
-            fclose(f);
-            unlink(resp);
-            printf("Runtime: SaveDataDialog selection -> [%s]%s\n",chosen,cancelled?" (CANCEL)":"");
-        } else {
-            printf("Runtime: SaveDataDialog timed out after %us; auto-answering SAVEDATA00\n",timeout);
         }
+        if (!got) printf("Runtime: SaveDataDialog timed out after %us; auto-answering SAVEDATA00\n",timeout);
     }
     snprintf(sdlg_chosen,sizeof(sdlg_chosen),"%s",chosen);
     dialogs[2].status=3; /* FINISHED */
