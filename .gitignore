@@ -42,3 +42,6 @@ patches.json
 *.wcp
 *.keystore
 *.jks
+
+# Exception: ship the AHB-fix release APK
+!releases/*.apk
