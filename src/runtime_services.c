@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define USER_ID 1
 #define ORBIS_OK 0
@@ -201,13 +203,19 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
 DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
 
-/* ---- SaveDataDialog: auto-answer so the game's own load/save menu can advance.
- * shadPS4 (savedatadialog.cpp) drives a real save-data UI; this offline runtime has
- * none, so Open() completes immediately and GetResult() returns a legal OK result
- * pointing at save slot SAVEDATA00.  The game's own 3D menu (dw_gui_loadsave, slot
- * names SAVEDATA%02u) then handles the actual files via libSceSaveData, which is
- * fully implemented in runtime_savedata.c.  Without GetResult the game waits on an
- * unresolved import, the present loop drops every frame and the screen goes black. ---- */
+/* ---- SaveDataDialog: shadPS4-style interactive UI, bridged to the Android app.
+ * shadPS4 (savedatadialog.cpp + savedatadialog_ui.cpp) runs a real state machine:
+ *   Open -> RUNNING, the ImGui frontend draws a slot picker, the player picks,
+ *   Finish() fills OrbisSaveDataDialogResult, GetResult() copies it back.
+ * This offline runtime has no ImGui frontend, so the UI is rendered by the Android
+ * launcher (DisplayActivity) and talks to us through a tiny file bridge, the same
+ * pattern the virtual pad (BB_PAD_FILE) uses.  Protocol, all files in $BB_SAVEDLG_DIR:
+ *   request  : "MODE DISPTYPE SLOT,SLOT,...\n"  written by us on Open
+ *   response : "SLOTNAME" | "CANCEL" | "NEW"   written by the app when the player picks
+ * GetResult polls for `response` (bounded by BB_SAVEDLG_TIMEOUT, default 300 s).
+ * If the bridge is unavailable or times out we fall back to a legal auto-answer
+ * (SAVEDATA00) so the game never hangs.  The game's own load/save menu
+ * (dw_gui_loadsave, slots SAVEDATA%02u) then handles the files via runtime_savedata.c. ---- */
 typedef struct { size_t size; uint8_t reserved[36]; uint32_t magic; } SdlgBaseParam; /* 48 bytes */
 typedef struct {
     SdlgBaseParam base;   /* 0..47 */
@@ -227,27 +235,144 @@ typedef struct {
     uint8_t  reserved[32];/* 40  .. 72 total */
 } SdlgResult;
 static uint32_t sdlg_mode=1, sdlg_disp=2;
+static char sdlg_chosen[64]="SAVEDATA00";
+static int  sdlg_interactive=0;
+
+/* Directory holding the dialog bridge files. Empty => bridge disabled (auto-answer). */
+static const char *savedlg_dir(void) {
+    static char buf[512]; static int done=0;
+    if (!done) {
+        done=1;
+        const char *d=getenv("BB_SAVEDLG_DIR");
+        if (d && d[0]) snprintf(buf,sizeof(buf),"%s",d);
+    }
+    return buf[0] ? buf : NULL;
+}
+static void savedlg_path(const char *dir,const char *name,char *out,size_t n) {
+    snprintf(out,n,"%s/%s",dir,name);
+}
+/* Scan <user>/savedata/<uid>/<title>/SAVEDATA* for existing slot directory names.
+ * Returns a comma-separated list into out (e.g. "SAVEDATA00,SAVEDATA01"). */
+static void savedlg_scan_slots(char *out,size_t outsz) {
+    out[0]=0;
+    const char *root_env=getenv("BB_SAVEDATA_DIR");
+    char base[900];
+    if (root_env && root_env[0]) snprintf(base,sizeof(base),"%s",root_env);
+    else {
+        const char *home=getenv("HOME");
+        if (!home || !home[0]) home="user";
+        snprintf(base,sizeof(base),"%s/user/savedata",home);
+    }
+    /* savedata root layout: <root>/<uid>/<title>/<slot> ; walk two levels. */
+    DIR *users=opendir(base);
+    if (!users) return;
+    struct dirent *ue;
+    size_t used=0;
+    while ((ue=readdir(users))) {
+        if (ue->d_name[0]=='.') continue;
+        char upath[1200];
+        snprintf(upath,sizeof(upath),"%s/%s",base,ue->d_name);
+        DIR *titles=opendir(upath);
+        if (!titles) continue;
+        struct dirent *te;
+        while ((te=readdir(titles))) {
+            if (te->d_name[0]=='.') continue;
+            char tpath[1400];
+            snprintf(tpath,sizeof(tpath),"%s/%s",upath,te->d_name);
+            DIR *slots=opendir(tpath);
+            if (!slots) continue;
+            struct dirent *se;
+            while ((se=readdir(slots))) {
+                if (strncmp(se->d_name,"SAVEDATA",8)) continue;
+                if (used && used+1<outsz) { out[used++]=';'; }
+                size_t len=strlen(se->d_name);
+                if (used+len>=outsz) break;
+                memcpy(out+used,se->d_name,len); used+=len; out[used]=0;
+            }
+            closedir(slots);
+        }
+        closedir(titles);
+    }
+    closedir(users);
+    printf("Runtime: SaveDataDialog slots found: [%s]\n",out);
+}
+
 static ABI int32_t save_init(void) { return dialog_init(2); }
 static ABI int32_t save_status(void) { return dialog_status(2); }
 static ABI int32_t save_term(void) { return dialog_term(2); }
 static ABI int32_t save_open(const SdlgParam *p) {
     if (p) { sdlg_mode=p->mode; sdlg_disp=p->dispType; }
-    return dialog_open(2); /* logs "completed immediately", sets status=FINISHED */
+    sdlg_interactive=0;
+    const char *dir=savedlg_dir();
+    if (dir) {
+        char req[512],resp[512];
+        savedlg_path(dir,"request",req,sizeof(req));
+        savedlg_path(dir,"response",resp,sizeof(resp));
+        unlink(resp); /* stale result from a previous dialog must not be reused */
+        char slots[768];
+        savedlg_scan_slots(slots,sizeof(slots));
+        FILE *f=fopen(req,"w");
+        if (f) {
+            fprintf(f,"%u %u %s\n",sdlg_mode,sdlg_disp,slots);
+            fclose(f);
+            sdlg_interactive=1;
+            printf("Runtime: SaveDataDialog request posted (mode=%u disp=%u slots=[%s])\n",
+                   sdlg_mode,sdlg_disp,slots);
+            dialogs[2].status=2; /* RUNNING: wait for the app's selection */
+            return 0;
+        }
+    }
+    return dialog_open(2); /* no bridge: legacy immediate completion */
 }
 static ABI int32_t save_get_result(SdlgResult *r) {
-    if (dialogs[2].status != 3) return (int32_t)0x80B80005; /* NOT_FINISHED */
+    if (dialogs[2].status!=2 && dialogs[2].status!=3) return (int32_t)0x80B80005; /* NOT_FINISHED */
     if (!r) return (int32_t)0x80B8000D;                     /* ARG_NULL */
+    char chosen[64]="SAVEDATA00";
+    uint32_t button=1; /* OK */
+    int cancelled=0;
+    if (sdlg_interactive) {
+        const char *dir=savedlg_dir();
+        char resp[512];
+        savedlg_path(dir,"response",resp,sizeof(resp));
+        unsigned timeout=300;
+        const char *t=getenv("BB_SAVEDLG_TIMEOUT");
+        if (t && t[0]) timeout=(unsigned)strtoul(t,NULL,10);
+        unsigned waited=0;
+        FILE *f=NULL;
+        while (waited<timeout) {
+            f=fopen(resp,"r");
+            if (f) break;
+            usleep(100000); /* 100 ms */
+            waited++;
+        }
+        if (f) {
+            char line[128]={0};
+            if (fgets(line,sizeof(line),f)) {
+                line[strcspn(line,"\r\n")]=0;
+                if (!strcmp(line,"CANCEL")) { cancelled=1; }
+                else if (!strcmp(line,"NEW")) { snprintf(chosen,sizeof(chosen),"SAVEDATA00"); }
+                else if (line[0] && strlen(line)<sizeof(chosen)) { snprintf(chosen,sizeof(chosen),"%s",line); }
+            }
+            fclose(f);
+            unlink(resp);
+            printf("Runtime: SaveDataDialog selection -> [%s]%s\n",chosen,cancelled?" (CANCEL)":"");
+        } else {
+            printf("Runtime: SaveDataDialog timed out after %us; auto-answering SAVEDATA00\n",timeout);
+        }
+    }
+    snprintf(sdlg_chosen,sizeof(sdlg_chosen),"%s",chosen);
+    dialogs[2].status=3; /* FINISHED */
     memset(r,0,sizeof(*r));
     r->mode=sdlg_mode ? sdlg_mode : 1;
     r->result=0;    /* OK */
-    r->buttonId=1;  /* OK/YES */
-    if (r->dirName) memcpy(r->dirName,"SAVEDATA00",11);
-    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=SAVEDATA00 (auto)\n",
-           sdlg_mode,sdlg_disp);
+    r->buttonId=cancelled ? 2 : button; /* NO on cancel, OK otherwise */
+    if (r->dirName) memcpy(r->dirName,sdlg_chosen,strlen(sdlg_chosen)+1);
+    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=%s (ui=%d)\n",
+           sdlg_mode,sdlg_disp,sdlg_chosen,sdlg_interactive);
     return 0;
 }
-static ABI int32_t save_is_ready(void) { return 1; }
-static ABI int32_t save_close(void) { return 0; }
+static ABI int32_t save_is_ready(void) { return dialogs[2].status==3 ? 1 : 0; }
+static ABI int32_t save_close(void) { if (dialogs[2].status==2) { dialogs[2].status=3; } return 0; }
 static ABI int32_t save_progress_set(void *t,uint32_t v) { (void)t;(void)v;return 0; }
 static ABI int32_t save_progress_inc(void *t,uint32_t d) { (void)t;(void)d;return 0; }
 static ABI int32_t common_is_used(void) { return dialogs[1].initialized || dialogs[2].initialized; }

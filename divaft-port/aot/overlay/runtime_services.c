@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define USER_ID 1
 #define ORBIS_OK 0
@@ -196,13 +198,19 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
 DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
 
-/* ---- SaveDataDialog: auto-answer so the game's own load/save menu can advance.
- * shadPS4 (savedatadialog.cpp) drives a real save-data UI; this offline runtime has
- * none, so Open() completes immediately and GetResult() returns a legal OK result
- * pointing at save slot SAVEDATA00.  The game's own 3D menu (dw_gui_loadsave, slot
- * names SAVEDATA%02u) then handles the actual files via libSceSaveData, which is
- * fully implemented in runtime_savedata.c.  Without GetResult the game waits on an
- * unresolved import, the present loop drops every frame and the screen goes black. ---- */
+/* ---- SaveDataDialog: shadPS4-style interactive UI, bridged to the Android app.
+ * shadPS4 (savedatadialog.cpp + savedatadialog_ui.cpp) runs a real state machine:
+ *   Open -> RUNNING, the ImGui frontend draws a slot picker, the player picks,
+ *   Finish() fills OrbisSaveDataDialogResult, GetResult() copies it back.
+ * This offline runtime has no ImGui frontend, so the UI is rendered by the Android
+ * launcher (DisplayActivity) and talks to us through a tiny file bridge, the same
+ * pattern the virtual pad (BB_PAD_FILE) uses.  Protocol, all files in $BB_SAVEDLG_DIR:
+ *   request  : "MODE DISPTYPE SLOT,SLOT,...\n"  written by us on Open
+ *   response : "SLOTNAME" | "CANCEL" | "NEW"   written by the app when the player picks
+ * GetResult polls for `response` (bounded by BB_SAVEDLG_TIMEOUT, default 300 s).
+ * If the bridge is unavailable or times out we fall back to a legal auto-answer
+ * (SAVEDATA00) so the game never hangs.  The game's own load/save menu
+ * (dw_gui_loadsave, slots SAVEDATA%02u) then handles the files via runtime_savedata.c. ---- */
 typedef struct { size_t size; uint8_t reserved[36]; uint32_t magic; } SdlgBaseParam; /* 48 bytes */
 typedef struct {
     SdlgBaseParam base;   /* 0..47 */
@@ -222,108 +230,148 @@ typedef struct {
     uint8_t  reserved[32];/* 40  .. 72 total */
 } SdlgResult;
 static uint32_t sdlg_mode=1, sdlg_disp=2;
+static char sdlg_chosen[64]="SAVEDATA00";
+static int  sdlg_interactive=0;
+
+/* Directory holding the dialog bridge files. Empty => bridge disabled (auto-answer). */
+static const char *savedlg_dir(void) {
+    static char buf[512]; static int done=0;
+    if (!done) {
+        done=1;
+        const char *d=getenv("BB_SAVEDLG_DIR");
+        if (d && d[0]) snprintf(buf,sizeof(buf),"%s",d);
+    }
+    return buf[0] ? buf : NULL;
+}
+static void savedlg_path(const char *dir,const char *name,char *out,size_t n) {
+    snprintf(out,n,"%s/%s",dir,name);
+}
+/* Scan <user>/savedata/<uid>/<title>/SAVEDATA* for existing slot directory names.
+ * Returns a comma-separated list into out (e.g. "SAVEDATA00,SAVEDATA01"). */
+static void savedlg_scan_slots(char *out,size_t outsz) {
+    out[0]=0;
+    const char *root_env=getenv("BB_SAVEDATA_DIR");
+    char base[900];
+    if (root_env && root_env[0]) snprintf(base,sizeof(base),"%s",root_env);
+    else {
+        const char *home=getenv("HOME");
+        if (!home || !home[0]) home="user";
+        snprintf(base,sizeof(base),"%s/user/savedata",home);
+    }
+    /* savedata root layout: <root>/<uid>/<title>/<slot> ; walk two levels. */
+    DIR *users=opendir(base);
+    if (!users) return;
+    struct dirent *ue;
+    size_t used=0;
+    while ((ue=readdir(users))) {
+        if (ue->d_name[0]=='.') continue;
+        char upath[1200];
+        snprintf(upath,sizeof(upath),"%s/%s",base,ue->d_name);
+        DIR *titles=opendir(upath);
+        if (!titles) continue;
+        struct dirent *te;
+        while ((te=readdir(titles))) {
+            if (te->d_name[0]=='.') continue;
+            char tpath[1400];
+            snprintf(tpath,sizeof(tpath),"%s/%s",upath,te->d_name);
+            DIR *slots=opendir(tpath);
+            if (!slots) continue;
+            struct dirent *se;
+            while ((se=readdir(slots))) {
+                if (strncmp(se->d_name,"SAVEDATA",8)) continue;
+                if (used && used+1<outsz) { out[used++]=';'; }
+                size_t len=strlen(se->d_name);
+                if (used+len>=outsz) break;
+                memcpy(out+used,se->d_name,len); used+=len; out[used]=0;
+            }
+            closedir(slots);
+        }
+        closedir(titles);
+    }
+    closedir(users);
+    printf("Runtime: SaveDataDialog slots found: [%s]\n",out);
+}
+
 static ABI int32_t save_init(void) { return dialog_init(2); }
 static ABI int32_t save_status(void) { return dialog_status(2); }
 static ABI int32_t save_term(void) { return dialog_term(2); }
 static ABI int32_t save_open(const SdlgParam *p) {
     if (p) { sdlg_mode=p->mode; sdlg_disp=p->dispType; }
-    return dialog_open(2); /* logs "completed immediately", sets status=FINISHED */
+    sdlg_interactive=0;
+    const char *dir=savedlg_dir();
+    if (dir) {
+        char req[512],resp[512];
+        savedlg_path(dir,"request",req,sizeof(req));
+        savedlg_path(dir,"response",resp,sizeof(resp));
+        unlink(resp); /* stale result from a previous dialog must not be reused */
+        char slots[768];
+        savedlg_scan_slots(slots,sizeof(slots));
+        FILE *f=fopen(req,"w");
+        if (f) {
+            fprintf(f,"%u %u %s\n",sdlg_mode,sdlg_disp,slots);
+            fclose(f);
+            sdlg_interactive=1;
+            printf("Runtime: SaveDataDialog request posted (mode=%u disp=%u slots=[%s])\n",
+                   sdlg_mode,sdlg_disp,slots);
+            dialogs[2].status=2; /* RUNNING: wait for the app's selection */
+            return 0;
+        }
+    }
+    return dialog_open(2); /* no bridge: legacy immediate completion */
 }
 static ABI int32_t save_get_result(SdlgResult *r) {
-    if (dialogs[2].status != 3) return (int32_t)0x80B80005; /* NOT_FINISHED */
+    if (dialogs[2].status!=2 && dialogs[2].status!=3) return (int32_t)0x80B80005; /* NOT_FINISHED */
     if (!r) return (int32_t)0x80B8000D;                     /* ARG_NULL */
+    char chosen[64]="SAVEDATA00";
+    uint32_t button=1; /* OK */
+    int cancelled=0;
+    if (sdlg_interactive) {
+        const char *dir=savedlg_dir();
+        char resp[512];
+        savedlg_path(dir,"response",resp,sizeof(resp));
+        unsigned timeout=300;
+        const char *t=getenv("BB_SAVEDLG_TIMEOUT");
+        if (t && t[0]) timeout=(unsigned)strtoul(t,NULL,10);
+        unsigned waited=0;
+        FILE *f=NULL;
+        while (waited<timeout) {
+            f=fopen(resp,"r");
+            if (f) break;
+            usleep(100000); /* 100 ms */
+            waited++;
+        }
+        if (f) {
+            char line[128]={0};
+            if (fgets(line,sizeof(line),f)) {
+                line[strcspn(line,"\r\n")]=0;
+                if (!strcmp(line,"CANCEL")) { cancelled=1; }
+                else if (!strcmp(line,"NEW")) { snprintf(chosen,sizeof(chosen),"SAVEDATA00"); }
+                else if (line[0] && strlen(line)<sizeof(chosen)) { snprintf(chosen,sizeof(chosen),"%s",line); }
+            }
+            fclose(f);
+            unlink(resp);
+            printf("Runtime: SaveDataDialog selection -> [%s]%s\n",chosen,cancelled?" (CANCEL)":"");
+        } else {
+            printf("Runtime: SaveDataDialog timed out after %us; auto-answering SAVEDATA00\n",timeout);
+        }
+    }
+    snprintf(sdlg_chosen,sizeof(sdlg_chosen),"%s",chosen);
+    dialogs[2].status=3; /* FINISHED */
     memset(r,0,sizeof(*r));
     r->mode=sdlg_mode ? sdlg_mode : 1;
     r->result=0;    /* OK */
-    r->buttonId=1;  /* OK/YES */
-    if (r->dirName) memcpy(r->dirName,"SAVEDATA00",11);
-    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=SAVEDATA00 (auto)\n",
-           sdlg_mode,sdlg_disp);
+    r->buttonId=cancelled ? 2 : button; /* NO on cancel, OK otherwise */
+    if (r->dirName) memcpy(r->dirName,sdlg_chosen,strlen(sdlg_chosen)+1);
+    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=%s (ui=%d)\n",
+           sdlg_mode,sdlg_disp,sdlg_chosen,sdlg_interactive);
     return 0;
 }
-static ABI int32_t save_is_ready(void) { return 1; }
-static ABI int32_t save_close(void) { return 0; }
+static ABI int32_t save_is_ready(void) { return dialogs[2].status==3 ? 1 : 0; }
+static ABI int32_t save_close(void) { if (dialogs[2].status==2) { dialogs[2].status=3; } return 0; }
 static ABI int32_t save_progress_set(void *t,uint32_t v) { (void)t;(void)v;return 0; }
 static ABI int32_t save_progress_inc(void *t,uint32_t d) { (void)t;(void)d;return 0; }
 static ABI int32_t common_is_used(void) { return dialogs[1].initialized || dialogs[2].initialized; }
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
-/* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
- * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
- * option, max length, char16 buffer, position, alignment, placeholder, title. */
-typedef struct {
-    int32_t user; uint32_t type; uint64_t languages; uint32_t enter_label, input_method;
-    void *filter; uint32_t option, max_length; uint16_t *buffer;
-    float x, y; uint32_t halign, valign; const uint16_t *placeholder, *title; int8_t reserved[16];
-} ImeParam;
-static struct { int running, finished, end_status; uint16_t *buffer; uint32_t max_length; } ime;
-static size_t utf16_to_utf8(const uint16_t *in, size_t limit, char *out, size_t size) {
-    size_t n=0;
-    for (size_t i=0; in && i<limit && in[i] && n+4<size; ++i) {
-        uint32_t c=in[i];
-        if (c>=0xD800 && c<0xDC00 && i+1<limit && in[i+1]>=0xDC00 && in[i+1]<0xE000) { c=0x10000+((c-0xD800)<<10)+(in[i+1]-0xDC00); ++i; }
-        if (c<0x80) out[n++]=(char)c;
-        else if (c<0x800) { out[n++]=(char)(0xC0|c>>6); out[n++]=(char)(0x80|(c&63)); }
-        else if (c<0x10000) { out[n++]=(char)(0xE0|c>>12); out[n++]=(char)(0x80|((c>>6)&63)); out[n++]=(char)(0x80|(c&63)); }
-        else { out[n++]=(char)(0xF0|c>>18); out[n++]=(char)(0x80|((c>>12)&63)); out[n++]=(char)(0x80|((c>>6)&63)); out[n++]=(char)(0x80|(c&63)); }
-    }
-    out[n]=0; return n;
-}
-static void utf8_to_utf16(const char *in, uint16_t *out, uint32_t max) {
-    uint32_t n=0;
-    for (const unsigned char *p=(const unsigned char *)in; *p && n<max;) {
-        uint32_t c; int extra;
-        if (*p<0x80) { c=*p; extra=0; } else if ((*p&0xE0)==0xC0) { c=*p&31; extra=1; }
-        else if ((*p&0xF0)==0xE0) { c=*p&15; extra=2; } else { c=*p&7; extra=3; }
-        ++p;
-        for (int k=0;k<extra && (*p&0xC0)==0x80;++k) c=(c<<6)|(*p++&63);
-        if (c>=0x10000) { if (n+2>max) break; c-=0x10000; out[n++]=(uint16_t)(0xD800+(c>>10)); out[n++]=(uint16_t)(0xDC00+(c&1023)); }
-        else out[n++]=(uint16_t)c;
-    }
-    out[n<max ? n : max]=0;
-}
-/* BB_IME_FILE (the Android frontend): the dialog is shown by the app with the touch keyboard. The
- * request file holds the maximum length (UTF-16 units), the title and the current text, a line
- * each; the app answers in <BB_IME_FILE>.result: "ok" or "cancel", then the text. Both files are
- * written whole under another name and renamed, so neither side reads half a file. */
-static const char *ime_bridge(void) {
-    const char *path=getenv("BB_IME_FILE");
-    return path && *path ? path : NULL;
-}
-static void one_line(char *text) { for (char *p=text; *p; ++p) if (*p=='\n' || *p=='\r') *p=' '; }
-static int ime_bridge_request(const char *path, const char *initial, const char *title, uint32_t max_length) {
-    char result[600], temporary[600];
-    snprintf(result,sizeof(result),"%s.result",path);
-    snprintf(temporary,sizeof(temporary),"%s.tmp",path);
-    unlink(result); /* an answer to an earlier, abandoned dialog */
-    char first[512], prompt[256];
-    snprintf(first,sizeof(first),"%s",initial); snprintf(prompt,sizeof(prompt),"%s",title);
-    one_line(first); one_line(prompt);
-    FILE *f=fopen(temporary,"w");
-    if (!f) return 0;
-    fprintf(f,"%u\n%s\n%s\n",max_length,prompt,first);
-    if (fclose(f) || rename(temporary,path)) { unlink(temporary); return 0; }
-    return 1;
-}
-/* 0: no answer yet; 1: confirmed (text set); 2: cancelled. */
-static int ime_bridge_poll(const char *path, char *text, size_t size) {
-    char result[600];
-    snprintf(result,sizeof(result),"%s.result",path);
-    FILE *f=fopen(result,"r");
-    if (!f) return 0;
-    char status[16]="";
-    text[0]=0;
-    if (!fgets(status,sizeof(status),f)) status[0]=0;
-    if (!fgets(text,(int)size,f)) text[0]=0;
-    fclose(f);
-    unlink(result);
-    text[strcspn(text,"\r\n")]=0;
-    return strncmp(status,"ok",2) ? 2 : 1;
-}
-static void ime_complete(int end_status, const char *text) {
-    if (!end_status && ime.buffer && ime.max_length) utf8_to_utf16(text,ime.buffer,ime.max_length);
-    ime.end_status=end_status; ime.finished=1; ime.running=0;
-    printf("Runtime: ImeDialog %s%s%s\n",end_status ? "cancelled" : "text: ",end_status ? "" : text,"");
-}
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
  * option, max length, char16 buffer, position, alignment, placeholder, title. */

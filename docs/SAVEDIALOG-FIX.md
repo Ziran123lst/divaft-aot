@@ -118,3 +118,43 @@ AHB 驱动保持不变,签名一致可覆盖安装。
 若出现**新的** `+0x.....` 地址 miss:说明还有未覆盖的间接跳转落点,
 把该地址发我,用同样的 `--extra-entries` 再补一次即可(每次真机跑会暴露一个)。
 若 miss 地址反复出现在同一处且补后无效,需检查 extra-entries 是否被正确解析。
+
+---
+
+## v1.2 回归与回退(2026-11-21)
+
+v1.2 用 `bb-recomp --extra-entries 0xa97d5` **全量重编**整个 libbbaot.so,引入了回退:
+- AOT 头从 v1.1 的 `57133 units, 0 unsupported` 变成 `57134 units, 10 unsupported`;
+- 游戏很早停在 `patched/hooked function has no variant at +0xc725530`,连画面都没了。
+结论:全量重编这条路线有害,已回退。v1.2.1 把 AOT 库换回 v1.1 完好版(57133 units),恢复画面。
+
+## v1.3 — 真正的存档 GUI(参考 shadPS4)
+
+按用户要求,放弃"自动应答",实现 shadPS4 式的**交互式存档选择界面**。
+shadPS4 用 ImGui 画槽位选择器;本移植 native 层无图形前端,改为 **Android 原生界面 + 文件桥接**
+(与现有虚拟手柄 BB_PAD_FILE 同一模式):
+
+- native (`runtime_services.c`):`SaveDataDialogOpen` 扫描已有存档槽(`<user>/savedata/*/*/SAVEDATA*`),
+  把 `mode/dispType/槽列表` 写到 `$BB_SAVEDLG_DIR/request`,状态置 RUNNING;
+  `GetResult` 轮询 `response` 文件(超时 BB_SAVEDLG_TIMEOUT,默认 600s),按玩家选择填
+  `OrbisSaveDataDialogResult`;桥接不可用/超时则回退自动应答,保证不卡死。
+- Java (`SaveDialogBridge.java` + `DisplayActivity`):后台线程轮询 request,
+  用原生 AlertDialog 显示"新建存档 + 已有槽位 + 取消",点选后写 response。
+- MainActivity 启动时创建桥接目录、设 `BB_SAVEDLG_DIR`/`BB_SAVEDLG_TIMEOUT` 环境变量。
+
+产物 `DIVA-Launcher-v1.3-SaveGUI.apk`:基于 v1.2.1 干净版,只替换 libbbprobe.so 与 classes.dex;
+AHB 驱动与 v1.1 完好 AOT 库均保持不变,签名一致可覆盖安装。
+
+## 仍存在的底层阻塞(需真机确认)
+
+v1.1 日志显示:存档 dialog 自动应答后游戏正常渲染 1140 帧、SAVEDATA00 成功挂载,
+但继续往下走会停在 `native code is missing an entry at +0xa97d5`(AOT 严格模式,
+无解释器/JIT 回退)。这是全 AOT 的固有问题,**GUI 解决不了它**——玩家在 GUI 里选完存档、
+游戏继续加载时仍可能撞到这个或后续的 miss。
+
+严格 AOT 的标准解法是 `--extra-entries`,但 v1.2 证明全量重编本工程会引入回退。
+后续方向:
+1. 找到当初生成 57133-unit 完好库的**确切工具版本与参数**,复刻构建、只多补一个入口;
+2. 或让真机能写出 `logs/aot-misses.log`(需先建 logs 目录/改用环境变量指定路径),
+   一次收集完整 miss 列表再决定;
+3. 若 miss 无法根除,GUI 版仍能让玩家真正看到并选择存档界面(体验优于黑屏)。
