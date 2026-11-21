@@ -81,3 +81,28 @@ STOP: GPU library assertion failed
 ## 我的建议
 
 先做 **选项 B**（诊断增强，快速、低风险、能一锤定音），根据真机返回的诊断信息再决定 A 还是 C。
+
+---
+
+## 实施记录（用户选择选项 A，已执行）
+
+用户选择选项 A（治本）。已完成修复版驱动的编译与打包：
+
+**编译产物**：`drivers/turnip-ahbfix/libvulkan_freedreno.so`（13.7 MB，Mesa 26.3.0-devel @ 35b085c）
+
+**打入的补丁**（BUILD-INFO.json 记录，共 7 个）：
+- 基础 6 个：0001 / 0006 / 0008 / 0009 / **0010（lazy hw_get_module → u_gralloc fallback）** / 0011
+- 新增 **0012-u_gralloc-always-ubwc-path.patch**：从 `v37/a8xx_gen8.patch` 里抽出 GPU 无关的 u_gralloc HACK——注释掉失效的 `'gmsm'` magic 门禁，改为无条件按 UBWC flag 计算 modifier。这个 hunk 只改 `src/util/u_gralloc/u_gralloc_fallback.c`，对 a7xx（735）同样适用。
+
+**为什么不直接用 26.3.1-lto / gen8 / 整个 a8xx_gen8.patch**：
+- 真机原来的 nihui 26.3.1-lto（17.6MB）与移交文档记载能 SHOW 帧的 Turnip R2（8.36MB）是两个不同驱动，本地均已丢失可用副本。
+- `gen8` / 整个 `a8xx_gen8.patch` 是针对 Adreno 8xx 的 V37 recipe，含大量 8xx 专用改动，不能套到 gen7 的 735 上。
+- 因此选用项目验证过的 main 配方（35b085c + fexdroid 补丁）+ 单独抽出 u_gralloc hunk，兼顾兼容性与针对性。
+
+**验证结果**：
+- BUILD-INFO 确认 0012 已打入；修复版 .so 中 gmsm magic 常量 count=0。
+- 反汇编确认 `vk_android_get_ahb_image_properties` → `u_gralloc_get_buffer_basic_info` → `fallback_gralloc_get_buffer_info`（修复点）的调用链成立：修复让 AHB 属性查询拿到正确 modifier 而非 `DRM_FORMAT_MOD_INVALID`。
+- 导出 `HMI`（HAL 直载，真机路径）+ `vk_icdGetInstanceProcAddr`（ICD 路径）双入口。
+- NEEDED 仅 Android 系统库，无 libhardware.so（0010 生效），可被 app namespace dlopen。
+
+**诚实边界**：无法在沙箱连接真机验证。部署与回退步骤见 `drivers/turnip-ahbfix/部署说明.md`。若真机仍失败，需根据新日志（是否变成 `No compatible AHB mem types` / `Failed to import dma-buf` / `has no GPU usage`）进一步定位，可能需要换驱动变体或改呈现后端（选项 C）。

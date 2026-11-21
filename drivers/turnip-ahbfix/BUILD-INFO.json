@@ -1,0 +1,40 @@
+{
+  "variant": "main",
+  "target": "android-arm64-api30",
+  "mesaRepository": "https://gitlab.freedesktop.org/mesa/mesa.git",
+  "mesaCommit": "35b085c4c067f198ce0b6437d94678e47b9c645f",
+  "mesaVersion": "26.3.0-devel",
+  "buildDate": "2026-11-21T12:11:32Z",
+  "patches": [
+    {
+      "file": "tools/android/mesa-patches/0001-freedreno-a840-kgsl-patchid-wildcard.patch",
+      "sha256": "cc622d3f26c74dc99f2efc5856773d381018312a4118cf5e82835cd6d11da752"
+    },
+    {
+      "file": "tools/android/mesa-patches/0006-tu-kgsl-power-constraint-from-the-environment.patch",
+      "sha256": "9ac4776a2a5dc829b03531ffd628c148ed7f4280e75b56a1a9b5f6c91414af9a"
+    },
+    {
+      "file": "tools/android/mesa-patches/0008-vulkan-in-process-opaque-fd-for-emulated-timelines.patch",
+      "sha256": "0820ff82124fe104675fc12f9db4706eabb6b3b328c4672308b7b25b4d02b45a"
+    },
+    {
+      "file": "tools/android/mesa-patches/0009-tu-kgsl-wake-pending-syncobj-waits-on-any-device-submit.patch",
+      "sha256": "b11776f497838c5cfff0c22224fefd4bbef773873c1f1c59eb1329e07a5cf065"
+    },
+    {
+      "file": "tools/android/mesa-patches/android/0010-android-stub-lazy-hw_get_module-without-libhardware-needed.patch",
+      "sha256": "c334a80977f0a2be4180d30cf6a29b169316317b12dc7622e9b9b52e666c8f13"
+    },
+    {
+      "file": "tools/android/mesa-patches/android/0011-vulkan-android-export-the-icd-entry-points.patch",
+      "sha256": "890495dc13730f82a9e575530d0e9904f0e66630640a3e563a1a9756f6421141"
+    },
+    {
+      "file": "tools/android/mesa-patches/android/0012-u_gralloc-always-ubwc-path.patch",
+      "sha256": "c6a1faf4f616cf37de3348e5d6bf412f76af1c87d1057cf220698641b9eef259"
+    }
+  ],
+  "library": "libvulkan_freedreno.so",
+  "librarySha256": "0fb864d8d508cac62365e90bf36f4cc4c60af8d58639ea7d6c2a92a4355421e5"
+}
