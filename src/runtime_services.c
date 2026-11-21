@@ -199,7 +199,58 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
+DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
+
+/* ---- SaveDataDialog: auto-answer so the game's own load/save menu can advance.
+ * shadPS4 (savedatadialog.cpp) drives a real save-data UI; this offline runtime has
+ * none, so Open() completes immediately and GetResult() returns a legal OK result
+ * pointing at save slot SAVEDATA00.  The game's own 3D menu (dw_gui_loadsave, slot
+ * names SAVEDATA%02u) then handles the actual files via libSceSaveData, which is
+ * fully implemented in runtime_savedata.c.  Without GetResult the game waits on an
+ * unresolved import, the present loop drops every frame and the screen goes black. ---- */
+typedef struct { size_t size; uint8_t reserved[36]; uint32_t magic; } SdlgBaseParam; /* 48 bytes */
+typedef struct {
+    SdlgBaseParam base;   /* 0..47 */
+    int32_t  size;        /* 48 */
+    uint32_t mode;        /* 52: SaveDataDialogMode (1=LIST ... 5=PROGRESS_BAR) */
+    uint32_t dispType;    /* 56: DialogType (1=SAVE 2=LOAD 3=DELETE) */
+    int32_t  pad;         /* 60 */
+} SdlgParam;
+typedef struct {
+    uint32_t mode;        /* 0  */
+    uint32_t result;      /* 4  : 0=OK */
+    uint32_t buttonId;    /* 8  : 1=OK/YES */
+    int32_t  pad;         /* 12 */
+    void    *dirName;     /* 16 : OrbisSaveDataDirName* (32-byte data) */
+    void    *param;       /* 24 : OrbisSaveDataParam* */
+    void    *userData;    /* 32 */
+    uint8_t  reserved[32];/* 40  .. 72 total */
+} SdlgResult;
+static uint32_t sdlg_mode=1, sdlg_disp=2;
+static ABI int32_t save_init(void) { return dialog_init(2); }
+static ABI int32_t save_status(void) { return dialog_status(2); }
+static ABI int32_t save_term(void) { return dialog_term(2); }
+static ABI int32_t save_open(const SdlgParam *p) {
+    if (p) { sdlg_mode=p->mode; sdlg_disp=p->dispType; }
+    return dialog_open(2); /* logs "completed immediately", sets status=FINISHED */
+}
+static ABI int32_t save_get_result(SdlgResult *r) {
+    if (dialogs[2].status != 3) return (int32_t)0x80B80005; /* NOT_FINISHED */
+    if (!r) return (int32_t)0x80B8000D;                     /* ARG_NULL */
+    memset(r,0,sizeof(*r));
+    r->mode=sdlg_mode ? sdlg_mode : 1;
+    r->result=0;    /* OK */
+    r->buttonId=1;  /* OK/YES */
+    if (r->dirName) memcpy(r->dirName,"SAVEDATA00",11);
+    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=SAVEDATA00 (auto)\n",
+           sdlg_mode,sdlg_disp);
+    return 0;
+}
+static ABI int32_t save_is_ready(void) { return 1; }
+static ABI int32_t save_close(void) { return 0; }
+static ABI int32_t save_progress_set(void *t,uint32_t v) { (void)t;(void)v;return 0; }
+static ABI int32_t save_progress_inc(void *t,uint32_t d) { (void)t;(void)d;return 0; }
+static ABI int32_t common_is_used(void) { return dialogs[1].initialized || dialogs[2].initialized; }
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
@@ -494,11 +545,17 @@ static const RuntimeExport exports[]={
     {"sceNpMatching2CreateContext",np_signed_out},
     {"sceNpSignalingInitialize",ok_void}, {"sceNpSignalingTerminate",ok_void},
     {"sceNpSignalingCreateContext",np_signed_out},
-    {"sceCommonDialogInitialize",common_init},
+    {"sceCommonDialogInitialize",common_init}, {"sceCommonDialogIsUsed",common_is_used},
     {"sceMsgDialogInitialize",msg_init}, {"sceMsgDialogOpen",msg_open},
     {"sceMsgDialogUpdateStatus",msg_status}, {"sceMsgDialogTerminate",msg_term},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceSaveDataDialogGetResult",save_get_result},
+    {"sceSaveDataDialogIsReadyToDisplay",save_is_ready},
+    {"sceSaveDataDialogGetStatus",save_status},
+    {"sceSaveDataDialogClose",save_close},
+    {"sceSaveDataDialogProgressBarSetValue",save_progress_set},
+    {"sceSaveDataDialogProgressBarInc",save_progress_inc},
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
     {"sceNpProfileDialogGetResult",profile_result},
