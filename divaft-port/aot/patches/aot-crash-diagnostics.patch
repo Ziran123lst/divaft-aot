@@ -1,0 +1,139 @@
+diff --git a/cpu/guest_cpu_aot.cpp b/cpu/guest_cpu_aot.cpp
+index 5d98660..1e2ab3a 100644
+--- a/cpu/guest_cpu_aot.cpp
++++ b/cpu/guest_cpu_aot.cpp
+@@ -12,6 +12,7 @@
+ #ifndef _GNU_SOURCE
+ #define _GNU_SOURCE
+ #endif
++#include <execinfo.h>
+ #include "guest_state.h"
+ #include "guest_cpu_atomics.h"
+ #include "guest_cpu_native.h"
+@@ -329,8 +330,22 @@ inline void HostCall(GuestState* s, void* fn, Thread* t) {
+     NoteGuestRsp(sp);
+     const uint64_t h0 = E.stats && !t->host_depth ? Ticks() : 0;
+     ++t->host_depth;
++    const uint64_t arg0 = s->gregs[RDI];
+     CallHostFn(s, fn);
+     --t->host_depth;
++    {
++        static const bool hle_trace = std::getenv("BB_HLE_TRACE") != nullptr;
++        if (hle_trace) {
++            Dl_info info {};
++            uintptr_t off = 0; const char* mod = "?";
++            if (dladdr(fn, &info)) { off = reinterpret_cast<uintptr_t>(fn) - reinterpret_cast<uintptr_t>(info.dli_fbase);
++                mod = info.dli_fname ? std::strrchr(info.dli_fname, '/') + 1 : "?";
++                if (info.dli_sname) { std::fprintf(stderr, "HLE t%d %s(arg0=%llx) -> rax=%llx\n", (int)syscall(SYS_gettid), info.dli_sname, (unsigned long long)arg0, (unsigned long long)s->gregs[RAX]); goto done; } }
++            std::fprintf(stderr, "HLE t%d %s+%llx(arg0=%llx) -> rax=%llx\n", (int)syscall(SYS_gettid), mod, (unsigned long long)off,
++                         (unsigned long long)arg0, (unsigned long long)s->gregs[RAX]);
++            done:;
++        }
++    }
+     if (h0) t->host_ticks += Ticks() - h0;
+     NoteGuestRsp(saved);
+     s->gregs[RSP] = sp + 8;
+@@ -1069,10 +1084,103 @@ __attribute__((visibility("default"))) void bbaot_crash_report(const void* ucont
+     std::fprintf(stderr, "AOT: fault at host pc %p (%s), guest rsp %#llx, rip %#llx, depth %u\n", reinterpret_cast<void*>(pc),
+                  pc >= E.so_lo && pc < E.so_hi ? "in a unit" : InCode(pc) ? "in guest code" : "elsewhere",
+                  (unsigned long long)t->s->gregs[RSP], (unsigned long long)t->s->rip, t->depth);
++    {
++        const uint64_t* g = t->s->gregs;
++        std::fprintf(stderr, "AOT: gregs: rax=%llx rcx=%llx rdx=%llx rbx=%llx rsp=%llx rbp=%llx rsi=%llx rdi=%llx\n",
++                     (unsigned long long)g[0],(unsigned long long)g[1],(unsigned long long)g[2],(unsigned long long)g[3],
++                     (unsigned long long)g[4],(unsigned long long)g[5],(unsigned long long)g[6],(unsigned long long)g[7]);
++        std::fprintf(stderr, "AOT:       r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx srip=%llx\n",
++                     (unsigned long long)g[8],(unsigned long long)g[9],(unsigned long long)g[10],(unsigned long long)g[11],
++                     (unsigned long long)g[12],(unsigned long long)g[13],(unsigned long long)g[14],(unsigned long long)g[15],
++                     (unsigned long long)t->s->rip);
++        // 内存探针：dump rbx/rdi 对象及其首成员指向的结构（getter 返回 null 诊断）
++        auto probe = [&](const char* tag, uint64_t addr) {
++            if (addr < 0x10000 || addr > 0x8000000000ull) return;
++            const uint64_t* p = reinterpret_cast<const uint64_t*>(addr);
++            std::fprintf(stderr, "AOT: mem@%s %llx:", tag, (unsigned long long)addr);
++            for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %llx", (unsigned long long)p[i]);
++            std::fprintf(stderr, "\n");
++            uint64_t q = p[0];
++            if (q >= 0x10000 && q < 0x8000000000ull) {
++                const uint64_t* r = reinterpret_cast<const uint64_t*>(q);
++                std::fprintf(stderr, "AOT:   [%s]=%llx ->", tag, (unsigned long long)q);
++                for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %llx", (unsigned long long)r[i]);
++                std::fprintf(stderr, " | +10=%llx +a0=%llx +a8=%llx\n",
++                             (unsigned long long)r[2], (unsigned long long)r[20], (unsigned long long)r[21]);
++            }
++        };
++        probe("rbx", g[3]); probe("rdi", g[7]);
++        // guest 栈回溯：dump 栈上像镜像返回地址的值
++        {
++            uint64_t sp = g[4];
++            if (sp >= 0x10000 && sp < 0x8000000000ull) {
++                const uint64_t* st = reinterpret_cast<const uint64_t*>(sp);
++                std::fprintf(stderr, "AOT: guest stack @%llx:", (unsigned long long)sp);
++                for (int i = 0; i < 8; ++i) {
++                    uint64_t v = st[i];
++                    if (v >= E.base && v < E.base + 0xc95852cull)
++                        std::fprintf(stderr, " [%d]=+%llx", i, (unsigned long long)(v - E.base));
++                }
++                std::fprintf(stderr, "\n");
++                uint64_t bp = g[5];
++                if (bp >= 0x10000 && bp < 0x8000000000ull) {
++                    const uint64_t* fb = reinterpret_cast<const uint64_t*>(bp);
++                    std::fprintf(stderr, "AOT: frame @rbp %llx:", (unsigned long long)bp);
++                    for (int i = -2; i < 6; ++i) {
++                        uint64_t v = fb[i];
++                        std::fprintf(stderr, " [%d]=%llx%s", i, (unsigned long long)v,
++                                     (v >= E.base && v < E.base + 0xc95852cull) ? "(code)" : "");
++                    }
++                    std::fprintf(stderr, "\n");
++                    // 沿 rbp 链回溯
++                    for (int depth = 0; depth < 4 && bp >= 0x10000 && bp < 0x8000000000ull; ++depth) {
++                        const uint64_t* f = reinterpret_cast<const uint64_t*>(bp);
++                        uint64_t ret = f[1], next = f[0];
++                        std::fprintf(stderr, "AOT: bt%d rbp=%llx ret=%llx(+%llx)\n", depth,
++                                     (unsigned long long)bp, (unsigned long long)ret,
++                                     (ret >= E.base && ret < E.base + 0xc95852cull) ? (unsigned long long)(ret - E.base) : 0ull);
++                        if (next <= bp || next >= 0x8000000000ull) break;
++                        bp = next;
++                    }
++                }
++            }
++        }
++#if defined(__aarch64__) && defined(__linux__)
++        const auto& mc = static_cast<const ucontext_t*>(ucontext)->uc_mcontext;
++        std::fprintf(stderr, "AOT: hostregs:");
++        for (int i = 0; i < 31; ++i) std::fprintf(stderr, " x%d=%llx", i, (unsigned long long)mc.regs[i]);
++        std::fprintf(stderr, " sp=%llx pc=%llx\n", (unsigned long long)mc.sp, (unsigned long long)mc.pc);
++#endif
++    }
+     if (pc >= E.so_lo && pc < E.so_hi) {
+         auto at = std::upper_bound(E.by_address.begin(), E.by_address.end(), pc, [](uintptr_t v, const Engine::Where& w) { return v < w.fn; });
+         if (at != E.by_address.begin()) std::fprintf(stderr, "AOT: unit +%#x, offset %#llx in it\n", (at - 1)->vaddr, (unsigned long long)(pc - (at - 1)->fn));
+     }
++    {
++        void* bt[24]; int n = backtrace(bt, 24);
++        std::fprintf(stderr, "AOT: host backtrace:");
++        for (int i = 0; i < n; ++i) {
++            Dl_info bi {};
++            if (dladdr(bt[i], &bi) && bi.dli_fname)
++                std::fprintf(stderr, " %s+%llx", std::strrchr(bi.dli_fname,'/')+1,
++                             (unsigned long long)(reinterpret_cast<uintptr_t>(bt[i]) - reinterpret_cast<uintptr_t>(bi.dli_fbase)));
++            else std::fprintf(stderr, " %p", bt[i]);
++        }
++        std::fprintf(stderr, "\n");
++    }
++    {
++        Dl_info fi {};
++        if (dladdr(reinterpret_cast<void*>(pc), &fi) && fi.dli_fname)
++            std::fprintf(stderr, "AOT: fault module %s+%llx (%s)\n", std::strrchr(fi.dli_fname,'/')+1,
++                         (unsigned long long)(pc - reinterpret_cast<uintptr_t>(fi.dli_fbase)), fi.dli_sname ? fi.dli_sname : "?");
++#if defined(__aarch64__) && defined(__linux__)
++        uintptr_t lr = static_cast<const ucontext_t*>(ucontext)->uc_mcontext.regs[30];
++        Dl_info fl {};
++        if (dladdr(reinterpret_cast<void*>(lr), &fl) && fl.dli_fname)
++            std::fprintf(stderr, "AOT: caller module %s+%llx (%s)\n", std::strrchr(fl.dli_fname,'/')+1,
++                         (unsigned long long)(lr - reinterpret_cast<uintptr_t>(fl.dli_fbase)), fl.dli_sname ? fl.dli_sname : "?");
++#endif
++    }
+     if (E.trace) {
+         const unsigned n = t->trace_n, first = n > Thread::TraceSize ? n - Thread::TraceSize : 0;
+         std::fprintf(stderr, "AOT: tid %d, last %u transitions:\n", int(syscall(SYS_gettid)), n - first);

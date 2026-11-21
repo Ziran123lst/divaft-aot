@@ -1,0 +1,546 @@
+// divaft_Android — guest↔host 桥接实现（原创）
+// 原理：guest(x86-64) 调系统函数跳入 veneer（x86 桩）触发 FEX 陷入，
+// 桥接层把 SysV 参数转 AAPCS64 调原生 HLE，再把返回值搬回 guest。
+// FEX 集成以 DIVAFT_WITH_FEX 守卫；未定义时退化为桩（供本机加载器构建）。
+//
+// 本轮（里程碑23）参照 uncharted 真机验证的 guest_cpu_fex.cpp：
+//  - per-call 独立 guest 栈（支持并发 guest 线程，pthread_create 的前提）；
+//  - 返回蹦床：把 exit_hlt 地址写进 [rsp] 作返回地址，guest 函数 ret 即落 HLT 干净退出，
+//    使"会返回的 guest 函数"（线程例程）可被 CallGuest 调用并取回 RAX；
+//  - per-call GDT，避免多线程共享段表竞态。
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "divaft/guest_bridge.h"
+
+#include <cstring>
+#include <atomic>
+#include <sys/mman.h>
+
+#ifdef DIVAFT_WITH_FEX
+#include <FEXCore/Core/Context.h>
+#include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/X86Enums.h>
+#include <FEXCore/Core/HostFeatures.h>
+#include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Config/Config.h>
+#include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#include <FEXCore/Utils/LongJump.h>
+#include <Common/HostFeatures.h>
+#include <csignal>
+#include <ucontext.h>
+#include <csetjmp>
+#include <unistd.h>
+#endif
+
+namespace divaft {
+
+constexpr uint64_t kVeneerSpace = 1 * 1024 * 1024;
+constexpr size_t kVeneerSize = 32;
+constexpr size_t kGuestStack = 1 * 1024 * 1024;  // 每次 CallGuest 的私有 guest 栈
+
+// veneer：guest 调系统函数跳入此桩。syscall 前把第4-6参（rcx→r10, r8, r9）压栈保存，
+// 因 FEX-qemu syscall 陷入会清 r8/r9/r10（实测）。HandleSyscall 从栈上读回。
+// 栈布局（syscall 时）：[rsp+0]=arg4 [rsp+8]=arg5 [rsp+16]=arg6 [rsp+24]=返回地址 [rsp+32..]=溢出参。
+static void EmitVeneer(uint8_t* p, uint32_t id) {
+  size_t i = 0;
+  p[i++] = 0x49; p[i++] = 0x89; p[i++] = 0xCA;  // mov r10, rcx（arg4）
+  p[i++] = 0xB8;                                 // mov eax, id
+  std::memcpy(p + i, &id, 4); i += 4;
+  p[i++] = 0x0F; p[i++] = 0x05;                 // syscall
+  p[i++] = 0xC3;                                 // ret
+}
+
+#ifdef DIVAFT_WITH_FEX
+
+namespace {
+thread_local FEXCore::Core::InternalThreadState* t_active_thread = nullptr;
+static bool g_sys_dbg = getenv("DIVA_SYS_DBG") != nullptr;
+static FEXCore::SignalDelegator* g_delegator = nullptr;  // SRA 真值读取
+thread_local sigjmp_buf t_exit_jmp;
+constexpr uint8_t kHlt = 0xF4;
+thread_local uint64_t t_callret_alloc = 0;
+thread_local uint64_t t_callret_alloc_size = 0;
+static FEXCore::ArchHelpers::Arm64::UnalignedHandlerType g_unaligned_type =
+    FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic;
+
+// gow3 式：从 ucontext 取 FPSIMD 记录（JIT 守护页溢出重启编译用）
+struct FpsimdRecord { uint32_t magic, size; uint32_t fpsr, fpcr; __uint128_t v[32]; };
+constexpr uint32_t FpsimdMagic = 0x46508001;
+static FpsimdRecord* Fpsimd(ucontext_t* uc) {
+  auto* at = reinterpret_cast<unsigned char*>(uc->uc_mcontext.__reserved);
+  auto* end = at + sizeof(uc->uc_mcontext.__reserved);
+  while (at + 8 <= end) {
+    uint32_t magic, size;
+    std::memcpy(&magic, at, 4); std::memcpy(&size, at + 4, 4);
+    if (magic == FpsimdMagic) return reinterpret_cast<FpsimdRecord*>(at);
+    if (!magic || size < 8) break;
+    at += size;
+  }
+  return nullptr;
+}
+
+// guest 以 HLT 结束执行（直接 HLT 或经返回蹦床 ret 到 exit_hlt）；故障信号里检测 HLT 跳出。
+void HostSignalHandler(int sig, siginfo_t* info, void* ucontext) {
+  auto* thread = t_active_thread;
+  if (thread) {
+    const auto& mctx = static_cast<const ucontext_t*>(ucontext)->uc_mcontext;
+    // gow3 式故障处理（在崩溃诊断之前）：callret 溢出 / JIT 守护页 / 非对齐 TSO 访问
+    auto& m = static_cast<ucontext_t*>(ucontext)->uc_mcontext;
+    const uint64_t faddr = reinterpret_cast<uint64_t>(info->si_addr);
+    if (sig == SIGSEGV) {
+      if (t_callret_alloc && faddr - t_callret_alloc < t_callret_alloc_size) {
+        m.regs[25] = reinterpret_cast<uint64_t>(thread->CallRetStackBase) +
+                     FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+        return;
+      }
+      if (thread->JITGuardPage && faddr - thread->JITGuardPage < 4096) {
+        if (auto* fp = Fpsimd(static_cast<ucontext_t*>(ucontext))) {
+          FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(thread->RestartJump,
+              thread->JITGuardOverflowArgument, reinterpret_cast<uint64_t*>(m.regs), fp->v,
+              reinterpret_cast<uint64_t*>(&m.pc));
+          return;
+        }
+      }
+    }
+    if (sig == SIGBUS && info->si_code == BUS_ADRALN &&
+        thread->CTX && thread->CTX->IsAddressInCodeBuffer(thread, m.pc)) {
+      if (const auto skip = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
+              thread, g_unaligned_type, m.pc, reinterpret_cast<uint64_t*>(m.regs))) {
+        m.pc += *skip;
+        return;
+      }
+    }
+    uint64_t rip = thread->CurrentFrame->State.rip;
+    // 精确 guest RIP：从 host PC 还原（gow3 同法），定位真正崩溃指令而非块首
+    if (thread->CTX && thread->CTX->IsAddressInCodeBuffer(thread, mctx.pc)) {
+      rip = thread->CTX->RestoreRIPFromHostPC(thread, mctx.pc);
+    }
+    if (rip && reinterpret_cast<const uint8_t*>(rip)[0] == kHlt) {
+      siglongjmp(t_exit_jmp, 1);
+    }
+    // 崩溃诊断：打印 guest rip / 信号 / fault 地址 / 全寄存器 / rip 处字节。
+    auto& gregs_frame = thread->CurrentFrame->State.gregs;
+    uint64_t gregs_buf[16];
+    std::memcpy(gregs_buf, gregs_frame, sizeof(gregs_buf));
+    if (g_delegator) {  // SRA 寄存器真值在 host 寄存器，frame 是陈旧值
+      const auto& cfg = g_delegator->GetConfig();
+      for (unsigned i = 0; i < cfg.SRAGPRCount && i < 16; ++i)
+        gregs_buf[i] = mctx.regs[cfg.SRAGPRMapping[i]];
+    }
+    auto* gregs = gregs_buf;
+    std::fprintf(stderr, "[guest-crash] sig=%d code=%d rip=0x%llx faultaddr=%llx hostpc=%llx bytes:",
+                 sig, info->si_code, (unsigned long long)rip, (unsigned long long)info->si_addr,
+                 (unsigned long long)mctx.pc);
+    if (rip) {
+      for (int i = 0; i < 12; ++i)
+        std::fprintf(stderr, " %02x", reinterpret_cast<const uint8_t*>(rip)[i]);
+    }
+    std::fprintf(stderr, "\n[guest-crash] gregs:");
+    for (int i = 0; i < 16; ++i)
+      std::fprintf(stderr, " r%d=%llx", i, (unsigned long long)gregs[i]);
+    std::fprintf(stderr, "\n[guest-crash] hostregs:");
+    for (int i = 0; i < 31; ++i)
+      std::fprintf(stderr, " x%d=%llx", i, (unsigned long long)mctx.regs[i]);
+    std::fprintf(stderr, " sp=%llx\n", (unsigned long long)mctx.sp);
+    // 调用者上下文：栈回溯 + 调用者代码字节（定位 eboot 触发指令序列）。
+    // veneer 经 call 进入，[rsp]=返回地址；dump 调用者前 48 后 16 字节供反汇编。
+    const uint64_t crash_rsp = gregs[FEXCore::X86State::REG_RSP];
+    if (crash_rsp > 0x10000 && crash_rsp < 0x100000000ULL) {
+      const uint64_t* sp = reinterpret_cast<const uint64_t*>(crash_rsp);
+      std::fprintf(stderr, "[guest-crash] stack@rsp:");
+      for (int i = 0; i < 8; ++i)
+        std::fprintf(stderr, " %llx", (unsigned long long)sp[i]);
+      std::fprintf(stderr, "\n");
+      const uint64_t ret = sp[0];
+      if (ret > 0x10000 && ret < 0x100000000ULL) {
+        std::fprintf(stderr, "[guest-crash] caller@%llx:", (unsigned long long)ret);
+        const uint8_t* cp = reinterpret_cast<const uint8_t*>(ret);
+        for (int i = -48; i < 16; ++i)
+          std::fprintf(stderr, " %02x", cp[i]);
+        std::fprintf(stderr, "\n");
+      }
+      // 帧指针回溯：[rbp+8]=返回地址，走 4 层，dump 每层调用方代码字节
+      uint64_t fp = gregs[FEXCore::X86State::REG_RBP];
+      for (int frame = 0; frame < 4; ++frame) {
+        if (fp <= 0x10000 || fp >= 0x100000000ULL) break;
+        const uint64_t* fpp = reinterpret_cast<const uint64_t*>(fp);
+        const uint64_t ra = fpp[1];
+        std::fprintf(stderr, "[bt%d] rbp=%llx ret=%llx", frame, (unsigned long long)fp, (unsigned long long)ra);
+        if (ra > 0x10000 && ra < 0x100000000ULL) {
+          const uint8_t* cp = reinterpret_cast<const uint8_t*>(ra);
+          {  // 每层调用方 dump 到文件供反汇编
+            char fn[64]; snprintf(fn, sizeof(fn), "/tmp/caller%d.bin", frame);
+            if (ra >= 0x10000 + 200 && ra + 40 < 0x100000000ULL) {
+              if (FILE* f = fopen(fn, "wb")) { fwrite(cp - 200, 1, 240, f); fclose(f); }
+            }
+            std::fprintf(stderr, " caller%d_base=%llx", frame, (unsigned long long)(ra - 200));
+          }
+          std::fprintf(stderr, " code:");
+          for (int i = -24; i < 8; ++i) std::fprintf(stderr, " %02x", cp[i]);
+        }
+        std::fprintf(stderr, "\n");
+        fp = fpp[0];
+      }
+    }
+    siglongjmp(t_exit_jmp, 2);
+  }
+  _exit(128 + sig);
+}
+}  // namespace
+
+class GuestSignalDelegator final : public FEXCore::SignalDelegator {
+public:
+  uint64_t callback_ret_addr = 0;
+  uintptr_t GetThunkCallbackRET() const override { return callback_ret_addr; }
+  bool Install() {
+    struct sigaction act {};
+    act.sa_sigaction = &HostSignalHandler;
+    act.sa_flags = SA_SIGINFO;
+    sigemptyset(&act.sa_mask);
+    for (int sig : {SIGSEGV, SIGILL, SIGTRAP, SIGBUS}) {
+      if (sigaction(sig, &act, nullptr) != 0) return false;
+    }
+    return true;
+  }
+};
+
+class VeneerSyscallHandler final : public FEXCore::HLE::SyscallHandler {
+public:
+  VeneerSyscallHandler(std::unordered_map<uint32_t, Veneer>* by_id, uint64_t base, uint64_t size)
+      : by_id_(by_id), base_(base), size_(size) {
+  }
+  void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
+    auto& gregs = Frame->State.gregs;
+    uint32_t id = static_cast<uint32_t>(gregs[FEXCore::X86State::REG_RAX]);
+    if (g_sys_dbg) std::fprintf(stderr, "[sys-entry] id=%u rsp=0x%llx rip=0x%llx\n", id,
+                 (unsigned long long)gregs[FEXCore::X86State::REG_RSP],
+                 (unsigned long long)Frame->State.rip);
+    Frame->State.rip += 2;  // new FEX: handler 须自行推进 RIP 过 syscall(0F 05)，分发器按 State.rip 重入
+    if (g_sys_dbg) std::fprintf(stderr, "[sys-dbg] enter rcx=%llx rbx=%llx rax=%llx rsp=%llx rip=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+                 (unsigned long long)gregs[FEXCore::X86State::REG_RCX],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_RBX],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_RAX],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_RSP],
+                 (unsigned long long)Frame->State.rip,
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R12],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R13],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R14],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R15]);
+    auto it = by_id_->find(id);
+    if (it == by_id_->end()) return;
+    // 诊断：读栈参前先打印函数名（定位读栈崩溃的函数）
+    std::fprintf(stderr, "[sys] %s rsp=0x%llx\n", it->second.name.c_str(),
+                 (unsigned long long)gregs[FEXCore::X86State::REG_RSP]);
+    // SysV 前3参 RDI/RSI/RDX（FEX 保住）；第4-6参由 veneer 压栈保存（FEX-qemu syscall 清 r8/r9/r10）。
+    uint64_t int_args[14] = {
+        gregs[FEXCore::X86State::REG_RDI], gregs[FEXCore::X86State::REG_RSI],
+        gregs[FEXCore::X86State::REG_RDX], gregs[FEXCore::X86State::REG_R10],
+        gregs[FEXCore::X86State::REG_R8], gregs[FEXCore::X86State::REG_R9]};
+    const uint64_t rsp = gregs[FEXCore::X86State::REG_RSP];
+    if (rsp) {
+      // veneer push r12-r15（32B）：[rsp..24]=保存寄存器 [rsp+32]=返回地址 [rsp+40..]=第7+溢出参
+      std::memcpy(&int_args[6], reinterpret_cast<const void*>(rsp + 8), 8 * sizeof(uint64_t));
+    }
+    // 浮点参 XMM0..7 低 64 位（参照 uncharted：st.xmm.sse.data[i][0]）。
+    double fp_args[8];
+    for (int i = 0; i < 8; ++i) {
+      uint64_t bits = Frame->State.xmm.sse.data[i][0];
+      std::memcpy(&fp_args[i], &bits, 8);
+    }
+    HleReturn hret {};
+    uint64_t ret = it->second.fn(int_args, 14, fp_args, &hret);
+    std::fprintf(stderr, "[sys-ret] %s a0=0x%llx -> 0x%llx\n", it->second.name.c_str(),
+                 (unsigned long long)int_args[0], (unsigned long long)ret);
+    gregs[FEXCore::X86State::REG_RAX] = ret;
+    if (g_sys_dbg) std::fprintf(stderr, "[sys-dbg] exit  r12=%llx r13=%llx r14=%llx r15=%llx\n",
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R12],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R13],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R14],
+                 (unsigned long long)gregs[FEXCore::X86State::REG_R15]);
+    if (hret.rdx_set) gregs[FEXCore::X86State::REG_RDX] = hret.rdx;
+    if (hret.fp) {
+      Frame->State.xmm.sse.data[0][0] = hret.xmm0;
+      Frame->State.xmm.sse.data[1][0] = hret.xmm1;
+    }
+  }
+  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(
+      FEXCore::Core::InternalThreadState*, uint64_t) override {
+    // 覆盖整个低 4G（eboot + 自带 libc 等多模块均在其中），参照 uncharted 全地址空间做法。
+    return {0, 0x100000000ULL, true};
+  }
+  std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(
+      FEXCore::Core::InternalThreadState*, uint64_t) override {
+    return std::nullopt;
+  }
+private:
+  std::unordered_map<uint32_t, Veneer>* by_id_;
+  uint64_t base_, size_;
+};
+
+#endif  // DIVAFT_WITH_FEX
+
+struct GuestBridge::Impl {
+  uint64_t guest_base = 0;
+  uint64_t guest_size = 0;
+  uint8_t* veneer_space = nullptr;
+  uint64_t exit_hlt = 0;      // 返回蹦床：HLT 桩的 guest 地址
+  uint64_t boot_stub = 0;     // boot 引导桩：跳过 HandleCallback 蹦床指向 EntryParams，jmp rax 到真实入口
+  uint64_t tcb = 0;           // guest TCB（fs/gs 基址，libc TLS 访问需要）
+  uint32_t next_id = 1;       // id 0 保留给 exit_hlt
+  std::unordered_map<uint32_t, Veneer> by_id;
+  bool initialized = false;
+#ifdef DIVAFT_WITH_FEX
+  fextl::unique_ptr<FEXCore::Context::Context> ctx;
+  GuestSignalDelegator signals;
+  fextl::unique_ptr<VeneerSyscallHandler> syscalls;
+  FEXCore::Core::CPUState::gdt_segment gdt[32] {};  // 持久段表（FEX 执行期引用，须稳定地址）
+#endif
+};
+
+GuestBridge::GuestBridge() : impl_(new Impl) {}
+GuestBridge::~GuestBridge() { Shutdown(); delete impl_; }
+
+bool GuestBridge::Init(uint64_t guest_base, uint64_t guest_size) {
+  impl_->guest_base = guest_base;
+  impl_->guest_size = guest_size;
+  uint64_t vbase = guest_base + guest_size - kVeneerSpace;
+  void* p = mmap(reinterpret_cast<void*>(vbase), kVeneerSpace,
+                 PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (p == MAP_FAILED) return false;
+  impl_->veneer_space = static_cast<uint8_t*>(p);
+  // 返回蹦床：veneer 空间首 16 字节放 HLT（id 0 保留）。guest 函数 ret 到此即退出。
+  impl_->exit_hlt = vbase;
+  std::memset(impl_->veneer_space, 0, kVeneerSize);
+  impl_->veneer_space[0] = 0x0F; impl_->veneer_space[1] = 0x3E;  // CALLBACKRET(0f3e)：HandleCallback 返回蹦床
+  // boot 引导桩（veneer 空间 +0x10000）：add rsp,16 跳过蹦床→[rsp]=EntryParams[0]；jmp rax(=真实入口)
+  impl_->boot_stub = vbase + 0x10000;
+  uint8_t* bs = impl_->veneer_space + 0x10000;
+  bs[0]=0x48; bs[1]=0x83; bs[2]=0xC4; bs[3]=0x10;  // add rsp, 16（64位SRA下 HandleCallback 实测 -16，使 eboot 入口=sp+8 8mod16）
+  bs[4]=0xFF; bs[5]=0xE0;                          // jmp rax
+
+  // guest TCB：libc 经 fs/gs 段访问 TLS/线程指针，需建立 TCB 并设 fs/gs 基址（参照 uncharted/shadPS4）。
+  // shadPS4 Tcb 布局：[0]=self [8]=dtv [16]=thread [24/32]=spare [40]=canary [48]=fiber。
+  // 低 4G 页；首选地址被占（如自检 bridge 未释放）则顺延，避免静默失败致 fs/gs=0。
+  {
+    for (uint64_t tcb_addr = 0x48000000; tcb_addr < 0x49000000; tcb_addr += 4096) {
+      void* tp = mmap(reinterpret_cast<void*>(tcb_addr), 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+      if (tp != MAP_FAILED) {
+        impl_->tcb = tcb_addr;
+        std::memset(tp, 0, 4096);
+        *reinterpret_cast<uint64_t*>(tcb_addr + 0) = tcb_addr;       // tcb_self
+        *reinterpret_cast<uint64_t*>(tcb_addr + 40) = 0x9e3779b97f4a7c15ULL;  // tcb_canary
+        break;
+      }
+    }
+    if (!impl_->tcb) std::fprintf(stderr, "[bridge] 警告：TCB 分配失败，fs/gs 将为 0\n");
+  }
+
+#ifdef DIVAFT_WITH_FEX
+  FEXCore::Config::Initialize();
+  FEXCore::Config::Load();
+  // 关键时序：ReloadMetaLayer 会 clear+重合并各层，必须先 reload 再 Set，
+  // 否则 Set 的值被冲掉 → Is64BitMode=0 → emitter 用 32 位 SRA(10个) → R12-R15 越界。
+  FEXCore::Config::ReloadMetaLayer();
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
+  if (getenv("DIVA_NO_MULTIBLOCK")) FEXCore::Config::Set(FEXCore::Config::CONFIG_MULTIBLOCK, "0");
+  if (getenv("DIVA_RSP_ASSERT")) {  // 调试：单步+CompileBlock RSP对齐断言
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_MAXINST, "1");
+  }
+  if (getenv("DIVA_DUMP_IR")) {  // 调试：DIVA_DUMP_IR=stderr 或目录路径
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_DUMPIR, getenv("DIVA_DUMP_IR"));
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_PASSMANAGERDUMPIR, "afteropt");
+  }
+  if (getenv("DIVA_DBG_CFG")) {
+    auto v = FEXCore::Config::Get(FEXCore::Config::CONFIG_IS64BIT_MODE);
+    std::fprintf(stderr, "[cfg] IS64BIT exists=%d val=%s\n",
+      (int)FEXCore::Config::Exists(FEXCore::Config::CONFIG_IS64BIT_MODE),
+      (v && *v) ? (*v)->c_str() : "(null)");
+  }
+  auto features = FEX::FetchHostFeatures();  // fb925d6f 无参
+  // 真机 Cortex-X4/A720 有 SVE2-128：保留 SVE128 自动探测（AVX128 路径内部依赖 SVE128，
+  // 强制关闭会破坏 256 位 AVX 翻译）。仅关 SVE256（真机 128 位向量长；qemu 误报 256 会生成非法指令）。
+  features.SupportsSVE256 = false;  // fb925d6f 直接位域
+  if (getenv("DIVA_NO_SVE")) { features.SupportsSVE128 = false; }  // 判决实验：对齐真机 SVE128=0
+  if (getenv("DIVA_NO_TSOIMM9")) { features.SupportsTSOImm9 = false; }  // qemu LDAPUR/STLUR 判决：关 FEAT_LRCPC2
+  features.SupportsSVEBitPerm = false;
+  std::fprintf(stderr, "[bridge] HostFeatures: AVX=%d SVE128=%d SVE256=%d\n",
+               (int)features.SupportsAVX, (int)features.SupportsSVE128, (int)features.SupportsSVE256);
+  impl_->ctx = FEXCore::Context::Context::CreateNewContext(features);
+  if (!impl_->ctx) return false;
+  impl_->syscalls = fextl::make_unique<VeneerSyscallHandler>(&impl_->by_id, guest_base, guest_size);
+  impl_->ctx->SetSignalDelegator(&impl_->signals);
+  g_delegator = &impl_->signals;
+  impl_->ctx->SetSyscallHandler(impl_->syscalls.get());
+  if (!impl_->signals.Install()) return false;
+  if (!impl_->ctx->InitCore()) return false;
+#endif
+  impl_->initialized = true;
+  return true;
+}
+
+uint64_t GuestBridge::ExposeHost(const std::string& name, HostFn fn) {
+  if (!impl_->initialized) return 0;
+  uint32_t id = impl_->next_id++;
+  uint64_t addr = reinterpret_cast<uint64_t>(impl_->veneer_space) + id * kVeneerSize;
+  EmitVeneer(impl_->veneer_space + id * kVeneerSize, id);
+  impl_->by_id[id] = Veneer{id, addr, name, std::move(fn)};
+  return addr;
+}
+
+uint64_t GuestBridge::DispatchSyscall(uint32_t veneer_id, const uint64_t* sysv_args,
+                                      const double* fp_args) {
+  auto it = impl_->by_id.find(veneer_id);
+  if (it == impl_->by_id.end()) return 0;
+  HleReturn hret {};
+  return it->second.fn(sysv_args, 6, fp_args, &hret);
+}
+
+uint64_t GuestBridge::CallGuest(uint64_t entry, const uint64_t* args, unsigned count) {
+  return CallGuest(entry, args, count, nullptr, 0);
+}
+
+uint64_t GuestBridge::CallGuest(uint64_t entry, const uint64_t* args, unsigned count,
+                                const uint64_t* stack_init, unsigned stack_init_count) {
+#ifdef DIVAFT_WITH_FEX
+  if (!impl_->initialized || !impl_->ctx) return 0;
+  // per-call 私有 guest 栈：低 4G（规避 FEX-qemu 高地址指针截断），并发各用独立栈。
+  static std::atomic<uint64_t> stack_cursor{0x60000000};
+  uint64_t sbase = stack_cursor.fetch_add(kGuestStack);
+  uint8_t* stack = static_cast<uint8_t*>(mmap(reinterpret_cast<void*>(sbase), kGuestStack,
+                                              PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
+  if (stack == MAP_FAILED) {
+    stack = static_cast<uint8_t*>(mmap(nullptr, kGuestStack, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  }
+  if (stack == MAP_FAILED) return 0;
+  const uint64_t stack_top = reinterpret_cast<uint64_t>(stack) + kGuestStack;
+  // gow3 式：sp=top-headroom，栈参在 sp，RSP=sp+8（HandleCallback 在 RSP-16 压 CALLBACKRET 蹦床）
+  uint64_t sp = (stack_top - 4096) & ~uint64_t(15);
+  const unsigned stack_args = count > 6 ? count - 6 : 0;
+  sp = (sp - stack_args * 8) & ~uint64_t(15);
+  for (unsigned i = 0; i < stack_args; ++i)
+    reinterpret_cast<uint64_t*>(sp)[i] = args[6 + i];
+  uint64_t rsp;
+  const bool boot_entry = stack_init_count >= 2;
+  uint64_t boot_ep_page = 0;
+  if (boot_entry && getenv("DIVA_GUARD_PAGE")) {
+    // 保护页抓现行：EntryParams 放栈底独立页(经 rdi)，entry_rsp 贴栈顶页顶-8，
+    // 栈顶上方一页 PROT_NONE。任何向上栈访问(>=stack_top)立即 SIGSEGV 拿 culprit RIP。
+    boot_ep_page = reinterpret_cast<uint64_t>(stack);
+    reinterpret_cast<uint64_t*>(boot_ep_page)[0] = stack_init[0];
+    reinterpret_cast<uint64_t*>(boot_ep_page)[1] = stack_init[1];
+    mmap(reinterpret_cast<void*>(stack_top), 0x1000, PROT_NONE,
+         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    rsp = stack_top - 8;  // entry_rsp 贴页顶-8；prologue 向下写有效页，向上错位>=stack_top 触保护页
+  } else if (boot_entry) {
+    rsp = sp + 8;
+    reinterpret_cast<uint64_t*>(sp + 8)[0] = stack_init[0];
+    reinterpret_cast<uint64_t*>(sp + 16)[0] = stack_init[1];
+  } else {
+    rsp = sp + 8;
+  }
+
+  auto* thread = impl_->ctx->CreateThread(nullptr);
+  if (!thread) { munmap(stack, kGuestStack); return 0; }
+  auto& state = thread->CurrentFrame->State;
+  state.rip = entry;  // new FEX: CreateThread no longer takes entry
+  state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = impl_->gdt;
+  state.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = impl_->gdt;
+  state.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
+  auto* cs = FEXCore::Core::CPUState::GetSegmentFromIndex(state, state.cs_idx);
+  FEXCore::Core::CPUState::SetGDTBase(cs, 0);
+  FEXCore::Core::CPUState::SetGDTLimit(cs, 0xFFFFF);
+  cs->L = 1; cs->D = 0;
+  state.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*cs);
+  state.mxcsr = 0x9fc0;  // PS4 默认 FTZ+DAZ
+  state.FCW = 0x037f;    // x87 FPU 控制字（对照 uncharted EnsureThread，libc 或用到 x87）
+  if (impl_->tcb) { state.fs_cached = impl_->tcb; state.gs_cached = impl_->tcb; }  // TLS/TCB
+  state.gregs[FEXCore::X86State::REG_RSP] = rsp;
+  // SysV host→guest 参数：RDI/RSI/RDX/RCX/R8/R9。
+  const int regs[6] = {FEXCore::X86State::REG_RDI, FEXCore::X86State::REG_RSI,
+                       FEXCore::X86State::REG_RDX, FEXCore::X86State::REG_RCX,
+                       FEXCore::X86State::REG_R8,  FEXCore::X86State::REG_R9};
+  for (unsigned i = 0; i < count && i < 6; ++i) state.gregs[regs[i]] = args[i];
+  if (boot_ep_page) state.gregs[FEXCore::X86State::REG_RDI] = boot_ep_page;  // eboot 经 rdi 读 EntryParams
+  state.gregs[FEXCore::X86State::REG_RAX] = boot_entry ? entry : 0;  // boot：引导桩 jmp rax 到真实入口
+  thread->CurrentFrame->Pointers.ThunkCallbackRet = impl_->exit_hlt;
+  impl_->signals.callback_ret_addr = impl_->exit_hlt;
+
+  // callret 预测栈（带守护页，per-call）。
+  const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t cr_size = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+  // callret 预测栈也放低 4G（与 guest 栈/映像一致，规避 FEX-qemu 高地址截断）。
+  static std::atomic<uint64_t> cr_cursor{0x70000000};
+  uint64_t cr_base = cr_cursor.fetch_add(cr_size + 2 * page);
+  auto* cr_alloc = static_cast<uint8_t*>(mmap(reinterpret_cast<void*>(cr_base), cr_size + 2 * page,
+                                              PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0));
+  if (cr_alloc == MAP_FAILED) {
+    cr_alloc = static_cast<uint8_t*>(mmap(nullptr, cr_size + 2 * page, PROT_NONE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  }
+  if (cr_alloc != MAP_FAILED) {
+    mprotect(cr_alloc + page, cr_size, PROT_READ | PROT_WRITE);
+    thread->CallRetStackBase = cr_alloc + page;
+    state.callret_sp = reinterpret_cast<uint64_t>(cr_alloc + page) + cr_size / 4;
+    t_callret_alloc = reinterpret_cast<uint64_t>(cr_alloc);
+    t_callret_alloc_size = cr_size + 2 * page;
+  }
+  // gow3：保存 gregs+rip；HandleCallback 自带 PushCalleeSavedRegisters，保 r14/r15 跨 syscall
+  uint64_t saved[16];
+  std::memcpy(saved, state.gregs, sizeof(saved));
+  const uint64_t saved_rip = state.rip;
+  t_active_thread = thread;
+  std::fprintf(stderr, "[callguest] entry=0x%llx rsp=0x%llx stackbase=0x%llx tcb=0x%llx\n",
+               (unsigned long long)entry, (unsigned long long)rsp,
+               (unsigned long long)reinterpret_cast<uint64_t>(stack), (unsigned long long)impl_->tcb);
+  uint64_t ret = 0;
+  if (sigsetjmp(t_exit_jmp, 1) == 0) {
+    if (boot_entry && boot_ep_page) {
+      impl_->ctx->HandleCallback(thread, entry);  // 保护页模式：EntryParams 经 rdi，直接进真实入口
+    } else if (boot_entry) {
+      impl_->ctx->HandleCallback(thread, impl_->boot_stub);
+    } else {
+      impl_->ctx->HandleCallback(thread, entry);
+    }
+    ret = state.gregs[FEXCore::X86State::REG_RAX];
+  } else {
+    ret = state.gregs[FEXCore::X86State::REG_RAX];
+  }
+  if (getenv("DIVA_DBG_RET")) {
+    std::fprintf(stderr, "[ret-dbg] final gregs:");
+    for (int i=0;i<16;++i) std::fprintf(stderr," r%d=%llx", i, (unsigned long long)state.gregs[i]);
+    std::fprintf(stderr," rip=%llx\n", (unsigned long long)state.rip);
+  }
+  t_active_thread = nullptr;
+  std::memcpy(state.gregs, saved, sizeof(saved));
+  state.rip = saved_rip;
+  impl_->ctx->DestroyThread(thread);
+  if (cr_alloc != MAP_FAILED) munmap(cr_alloc, cr_size + 2 * page);
+  munmap(stack, kGuestStack);
+  return ret;
+#else
+  (void)entry; (void)args; (void)count;
+  return 0;
+#endif
+}
+
+void GuestBridge::Shutdown() {
+  if (impl_->veneer_space) {
+    munmap(impl_->veneer_space, kVeneerSpace);
+    impl_->veneer_space = nullptr;
+  }
+  if (impl_->tcb) {
+    munmap(reinterpret_cast<void*>(impl_->tcb), 4096);
+    impl_->tcb = 0;
+  }
+#ifdef DIVAFT_WITH_FEX
+  impl_->ctx.reset();
+#endif
+  impl_->initialized = false;
+}
+
+}  // namespace divaft

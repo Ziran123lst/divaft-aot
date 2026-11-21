@@ -1,0 +1,883 @@
+// divaft_Android — guest 执行验证测试（原创）
+// 用 GuestBridge 在 FEX 下执行 x86-64 代码，验证桥接 + 翻译正确。
+// 用例：整数加法、标量浮点乘法（mulsd）、打包加法（addpd）。
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "divaft/guest_bridge.h"
+#include "divaft/diva_runtime.h"
+#include "divaft/guest_memory.h"
+
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <sys/mman.h>
+#include <thread>
+
+namespace {
+
+void Emit(std::vector<uint8_t>& c, std::initializer_list<uint8_t> bytes) {
+  c.insert(c.end(), bytes);
+}
+void MovRaxImm64(std::vector<uint8_t>& c, uint64_t v) {
+  Emit(c, {0x48, 0xB8});
+  for (int i = 0; i < 8; ++i) c.push_back((v >> (i * 8)) & 0xFF);
+}
+// mov r64, imm64（reg: 0=rax 1=rcx 2=rdx 3=rbx 4=rsp 5=rbp 6=rsi 7=rdi 8-15=r8-r15）
+void MovRegImm64(std::vector<uint8_t>& c, int reg, uint64_t v) {
+  if (reg < 8) Emit(c, {0x48, static_cast<uint8_t>(0xB8 + reg)});
+  else Emit(c, {0x49, static_cast<uint8_t>(0xB8 + (reg - 8))});
+  for (int i = 0; i < 8; ++i) c.push_back((v >> (i * 8)) & 0xFF);
+}
+uint64_t Bits(double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; }
+
+// 整数：rax = 100 + 23 = 123
+std::vector<uint8_t> BuildInt() {
+  std::vector<uint8_t> c;
+  MovRaxImm64(c, 100);
+  Emit(c, {0x48, 0x05, 0x17, 0x00, 0x00, 0x00});  // add rax, 23
+  Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                                 // hlt
+  return c;
+}
+
+// 浮点：xmm0 = 2.5 * 4.0 = 10.0，结果搬回 rax
+std::vector<uint8_t> BuildMulsd() {
+  std::vector<uint8_t> c;
+  MovRaxImm64(c, Bits(2.5));
+  Emit(c, {0x66, 0x48, 0x0F, 0x6E, 0xC0});  // movq xmm0, rax
+  MovRaxImm64(c, Bits(4.0));
+  Emit(c, {0x66, 0x48, 0x0F, 0x6E, 0xC8});  // movq xmm1, rax
+  Emit(c, {0xF2, 0x0F, 0x59, 0xC1});        // mulsd xmm0, xmm1
+  Emit(c, {0x66, 0x48, 0x0F, 0x7E, 0xC0});  // movq rax, xmm0
+  Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+  return c;
+}
+
+// 追加 call rel32 到 target（code 将放在 code_addr）。返回后 rel32 已算好。
+void EmitCallRel32(std::vector<uint8_t>& c, uint64_t code_addr, uint64_t target) {
+  c.push_back(0xE8);
+  size_t rel_off = c.size();
+  c.insert(c.end(), {0, 0, 0, 0});
+  int32_t rel = static_cast<int32_t>(target - (code_addr + rel_off + 4));
+  std::memcpy(c.data() + rel_off, &rel, 4);
+}
+
+// 宿主调用：rdi=7, rsi=5, 直接 call veneer（host 算 7+5=12），结果在 rax
+std::vector<uint8_t> BuildHostCall(uint64_t veneer_addr, uint64_t code_addr) {
+  std::vector<uint8_t> c;
+  MovRaxImm64(c, 7);
+  Emit(c, {0x48, 0x89, 0xC7});              // mov rdi, rax
+  MovRaxImm64(c, 5);
+  Emit(c, {0x48, 0x89, 0xC6});              // mov rsi, rax
+  EmitCallRel32(c, code_addr, veneer_addr); // call veneer（直接调用）
+  Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                          // hlt
+  return c;
+}
+
+// 自包含直接调用：call sub; hlt; sub: mov rax,42; ret（验证 call rel32）
+std::vector<uint8_t> BuildDirectCallRet(uint64_t code_addr) {
+  std::vector<uint8_t> c;
+  size_t call_off = c.size();
+  c.push_back(0xE8);
+  size_t rel_off = c.size();
+  c.insert(c.end(), {0, 0, 0, 0});
+  c.push_back(0xF4);                        // hlt
+  size_t sub = c.size();
+  MovRaxImm64(c, 42);
+  c.push_back(0xC3);                        // ret
+  int32_t rel = static_cast<int32_t>((code_addr + sub) - (code_addr + rel_off + 4));
+  std::memcpy(c.data() + rel_off, &rel, 4);
+  (void)call_off;
+  return c;
+}
+
+// 会返回的 guest 函数：mov rax, value; ret（不含 HLT）。
+// 验证返回蹦床：ret 落到 [rsp] 里的 exit_hlt，CallGuest 取回 RAX。线程例程即此形态。
+std::vector<uint8_t> BuildRetFunc(uint64_t value) {
+  std::vector<uint8_t> c;
+  MovRaxImm64(c, value);
+  c.push_back(0xC3);  // ret
+  return c;
+}
+
+struct Case { const char* name; std::vector<uint8_t> code; uint64_t want; };
+
+}  // namespace
+
+static bool RunSelfTests() {
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  setvbuf(stderr, nullptr, _IONBF, 0);
+  std::fprintf(stderr, "[divaft-guest] main started\n");
+  // 4MB 区域（代码+栈+1MB veneer）。优先低 4G 映射（规避 FEX-qemu 对 r8-r15 高地址指针截断）；
+  // 低地址避开静态二进制装载段（约 0x200000-0x59a000），用 MAP_FIXED_NOREPLACE 安全尝试、失败回退。
+  constexpr uint64_t kRegion = 4 * 1024 * 1024;
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+  void* region = mmap(reinterpret_cast<void*>(0x1000000ULL), kRegion,
+                      PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  if (region == MAP_FAILED) {
+    region = mmap(nullptr, kRegion, PROT_READ | PROT_WRITE | PROT_EXEC,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  }
+  if (region == MAP_FAILED) { std::perror("mmap"); return false; }
+  const uint64_t base = reinterpret_cast<uint64_t>(region);
+  std::fprintf(stderr, "[divaft-guest] mmap ok base=0x%llx (%s), calling Init\n",
+               (unsigned long long)base, base < 0x100000000ULL ? "低4G" : "高地址");
+
+  divaft::GuestBridge bridge;
+  if (!bridge.Init(base, kRegion)) {
+    std::fprintf(stderr, "GuestBridge Init failed\n");
+    return false;
+  }
+  std::fprintf(stderr, "[divaft-guest] Init ok\n");
+
+  Case cases[] = {
+      {"int_add", BuildInt(), 123},
+      {"fp_mulsd", BuildMulsd(), Bits(10.0)},
+  };
+
+  int passed = 0, total = 0;
+  for (auto& c : cases) {
+    ++total;
+    uint64_t code_addr = base + 0x1000 * total;
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.code.data(), c.code.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == c.want;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x%llx)\n",
+                c.name, ok ? "PASS" : "FAIL",
+                (unsigned long long)got, (unsigned long long)c.want);
+  }
+
+  // 隔离诊断：自包含直接调用 call rel32（sub 返回 42），验证直接调用机制
+  {
+    ++total;
+    uint64_t code_addr = base + 0x1000 * total;
+    auto c = BuildDirectCallRet(code_addr);
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 42;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x2a)\n",
+                "direct_call", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // veneer 宿主调用：guest 调 host 函数（7+5），验证 guest↔host 桥接往返
+  {
+    ++total;
+    uint64_t veneer = bridge.ExposeHost("host_add",
+        [](const uint64_t* args, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return args[0] + args[1];
+        });
+    uint64_t code_addr = base + 0x1000 * total;
+    auto code = BuildHostCall(veneer, code_addr);
+    std::memcpy(reinterpret_cast<void*>(code_addr), code.data(), code.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 12;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x%llx)\n",
+                "host_call", ok ? "PASS" : "FAIL",
+                (unsigned long long)got, 12ULL);
+  }
+
+  // 内存 HLE：guest 调 sceKernelAllocateDirectMemory，验证分配成功且输出 physAddr
+  {
+    ++total;
+    divaft::GuestMemoryManager mem;
+    mem.Init(base + 0x100000, 0x100000);  // 1MB 堆
+    uint64_t alloc_veneer = bridge.ExposeHost("sceKernelAllocateDirectMemory",
+        [&mem](const uint64_t* a, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          uint64_t phys = 0;
+          int r = mem.AllocateDirect(a[2], a[3], &phys);
+          std::fprintf(stderr, "[mem_hle] a0=%llx a1=%llx a2=%llx a3=%llx a4=%llx a5=%llx phys=%llx r=%d\n",
+                       (unsigned long long)a[0], (unsigned long long)a[1],
+                       (unsigned long long)a[2], (unsigned long long)a[3],
+                       (unsigned long long)a[4], (unsigned long long)a[5],
+                       (unsigned long long)phys, r);
+          if (r == 0 && a[5]) *reinterpret_cast<uint64_t*>(a[5]) = phys;
+          return static_cast<uint64_t>(r);
+        });
+    uint64_t code_addr = base + 0x1000 * total;
+    uint64_t phys_out = base + 0x9000;
+    *reinterpret_cast<uint64_t*>(phys_out) = 0;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 7, 0);             // rdi = searchStart
+    MovRegImm64(c, 6, 0x100000);      // rsi = searchEnd
+    MovRegImm64(c, 2, 0x4000);        // rdx = len
+    MovRegImm64(c, 1, 0x4000);        // rcx = alignment
+    MovRegImm64(c, 8, 0);             // r8 = memoryType
+    MovRegImm64(c, 9, phys_out);      // r9 = physAddrOut
+    EmitCallRel32(c, code_addr, alloc_veneer);  // 直接 call rel32（phase-2 验证过的形态）
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                  // hlt
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    uint64_t phys = *reinterpret_cast<uint64_t*>(phys_out);
+    bool ok = (got == 0) && (phys >= base + 0x100000) && (phys != 0);
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (ret=%llu phys=0x%llx)\n",
+                "mem_hle", ok ? "PASS" : "FAIL",
+                (unsigned long long)got, (unsigned long long)phys);
+  }
+
+  // 返回蹦床：guest 函数以 ret 结束（非 HLT），CallGuest 应取回 RAX。线程例程即此形态。
+  {
+    ++total;
+    uint64_t code_addr = base + 0x1000 * total;
+    auto c = BuildRetFunc(77);
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 77;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x4d)\n",
+                "ret_func", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 并发 guest 线程：两个宿主线程各调 CallGuest 执行会返回的 guest 函数，
+  // 验证 per-call 栈隔离（pthread_create 的底层机制）。
+  {
+    ++total;
+    uint64_t ca = base + 0x1000 * total;
+    uint64_t cb = base + 0x1000 * (total + 1);
+    auto fa = BuildRetFunc(111);
+    auto fb = BuildRetFunc(222);
+    std::memcpy(reinterpret_cast<void*>(ca), fa.data(), fa.size());
+    std::memcpy(reinterpret_cast<void*>(cb), fb.data(), fb.size());
+    uint64_t ra = 0, rb = 0;
+    std::thread ta([&]() { ra = bridge.CallGuest(ca, nullptr, 0); });
+    std::thread tb([&]() { rb = bridge.CallGuest(cb, nullptr, 0); });
+    ta.join(); tb.join();
+    bool ok = (ra == 111) && (rb == 222);
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (a=%llu b=%llu)\n",
+                "threads", ok ? "PASS" : "FAIL",
+                (unsigned long long)ra, (unsigned long long)rb);
+  }
+
+  // FP 编组：guest 把 2.0 放 XMM0 调 veneer，宿主算 2.0*3.0=6.0 经 HleReturn 写回 XMM0，
+  // guest 搬回 RAX。验证 XMM 输入(fp_args)与输出(HleReturn.xmm0)双向编组。
+  {
+    ++total;
+    uint64_t fp_veneer = bridge.ExposeHost("fp_mul3",
+        [](const uint64_t*, unsigned, const double* fp, divaft::HleReturn* ret) -> uint64_t {
+          double r = fp[0] * 3.0;
+          uint64_t bits; std::memcpy(&bits, &r, 8);
+          ret->xmm0 = bits; ret->fp = true;
+          return 0;
+        });
+    uint64_t code_addr = base + 0x10000;  // 独立页，避免与前面用例/phys_out 冲突
+    std::vector<uint8_t> c;
+    MovRaxImm64(c, Bits(2.0));
+    Emit(c, {0x66, 0x48, 0x0F, 0x6E, 0xC0});  // movq xmm0, rax
+    MovRaxImm64(c, fp_veneer);
+    Emit(c, {0xFF, 0xD0});                     // call rax
+    Emit(c, {0x66, 0x48, 0x0F, 0x7E, 0xC0});  // movq rax, xmm0
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                           // hlt
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == Bits(6.0);
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x%llx)\n",
+                "fp_hle", ok ? "PASS" : "FAIL",
+                (unsigned long long)got, (unsigned long long)Bits(6.0));
+  }
+
+  // 最小复现：间接 call veneer 多次（模拟启动经 PLT/GOT 调 operator new）。
+  // host_call 用直接 call rel32 能过；启动经间接 call 崩。此用例隔离"间接 call+重复"。
+  {
+    ++total;
+    uint64_t ind_veneer = bridge.ExposeHost("ind_alloc",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return 0xABC;  // 模拟 operator new 返回指针
+        });
+    uint64_t ptr_addr = base + 0x11000;   // GOT 样数据页
+    uint64_t code_addr = base + 0x12000;
+    *reinterpret_cast<uint64_t*>(ptr_addr) = ind_veneer;
+    std::vector<uint8_t> c;
+    for (int i = 0; i < 3; ++i) {
+      Emit(c, {0x48, 0xA1});              // mov rax, [moffs64]
+      for (int b = 0; b < 8; ++b) c.push_back((ptr_addr >> (b * 8)) & 0xFF);
+      Emit(c, {0xFF, 0xD0});              // call rax（间接）
+    }
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                       // hlt
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0xABC;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0xabc)\n",
+                "ind_call", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // PLT 样最小复现：call plt → plt: jmp [GOT] → veneer（启动经 PLT 调 operator new 的双层间接）。
+  // ind_call 是单层 call rax；此用例加 PLT 尾跳转，验证 callret 返回预测是否被 jmp 干扰。
+  {
+    ++total;
+    uint64_t plt_veneer = bridge.ExposeHost("plt_alloc",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return 0xDEF;
+        });
+    uint64_t got_addr = base + 0x13000;
+    uint64_t plt_addr = base + 0x14000;
+    uint64_t code_addr = base + 0x15000;
+    *reinterpret_cast<uint64_t*>(got_addr) = plt_veneer;
+    // PLT 桩：jmp [rip+disp]（FF 25），disp 相对 plt+6
+    {
+      uint8_t plt[6] = {0xFF, 0x25, 0, 0, 0, 0};
+      int32_t disp = static_cast<int32_t>(got_addr - (plt_addr + 6));
+      std::memcpy(plt + 2, &disp, 4);
+      std::memcpy(reinterpret_cast<void*>(plt_addr), plt, 6);
+    }
+    std::vector<uint8_t> c;
+    for (int i = 0; i < 3; ++i) {
+      size_t call_off = c.size();
+      c.push_back(0xE8);                    // call plt（rel32）
+      int32_t rel = static_cast<int32_t>(plt_addr - (code_addr + call_off + 5));
+      for (int b = 0; b < 4; ++b) c.push_back((rel >> (b * 8)) & 0xFF);
+    }
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                        // hlt
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0xDEF;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0xdef)\n",
+                "plt_call", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 调用次数压力：20 次 PLT 样间接调用（启动调 5+ 次后崩，验证 callret 栈累积假设）。
+  {
+    ++total;
+    uint64_t many_veneer = bridge.ExposeHost("many_alloc",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return 0x123;
+        });
+    uint64_t got_addr = base + 0x16000;
+    uint64_t plt_addr = base + 0x17000;
+    uint64_t code_addr = base + 0x18000;
+    *reinterpret_cast<uint64_t*>(got_addr) = many_veneer;
+    {
+      uint8_t plt[6] = {0xFF, 0x25, 0, 0, 0, 0};
+      int32_t disp = static_cast<int32_t>(got_addr - (plt_addr + 6));
+      std::memcpy(plt + 2, &disp, 4);
+      std::memcpy(reinterpret_cast<void*>(plt_addr), plt, 6);
+    }
+    std::vector<uint8_t> c;
+    for (int i = 0; i < 20; ++i) {
+      size_t call_off = c.size();
+      c.push_back(0xE8);
+      int32_t rel = static_cast<int32_t>(plt_addr - (code_addr + call_off + 5));
+      for (int b = 0; b < 4; ++b) c.push_back((rel >> (b * 8)) & 0xFF);
+    }
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0x123;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x123)\n",
+                "many_call", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 堆交互复现：veneer 用 GuestHeap.Malloc 返回堆指针（同启动 operator new），多次调用。
+  {
+    ++total;
+    static divaft::GuestHeap heap;
+    heap.Init(base + 0x200000, 0x100000);  // 1MB 堆
+    uint64_t heap_veneer = bridge.ExposeHost("heap_alloc",
+        [](const uint64_t* a, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return heap.Malloc(a[0]);
+        });
+    uint64_t got_addr = base + 0x19000;
+    uint64_t plt_addr = base + 0x1a000;
+    uint64_t code_addr = base + 0x1b000;
+    *reinterpret_cast<uint64_t*>(got_addr) = heap_veneer;
+    {
+      uint8_t plt[6] = {0xFF, 0x25, 0, 0, 0, 0};
+      int32_t disp = static_cast<int32_t>(got_addr - (plt_addr + 6));
+      std::memcpy(plt + 2, &disp, 4);
+      std::memcpy(reinterpret_cast<void*>(plt_addr), plt, 6);
+    }
+    std::vector<uint8_t> c;
+    for (int i = 0; i < 3; ++i) {
+      MovRegImm64(c, 7, 0x70);             // rdi = size 0x70（同启动）
+      size_t call_off = c.size();
+      c.push_back(0xE8);                    // call plt
+      int32_t rel = static_cast<int32_t>(plt_addr - (code_addr + call_off + 5));
+      for (int b = 0; b < 4; ++b) c.push_back((rel >> (b * 8)) & 0xFF);
+      Emit(c, {0x48, 0xC7, 0x00, 0x42, 0x00, 0x00, 0x00});  // mov qword [rax], 0x42（写堆指针）
+    }
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = (got != 0);  // 最后一次 malloc 返回非空
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (last_ptr=0x%llx)\n",
+                "heap_call", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // RFLAGS 保持：veneer syscall 返回后 RFLAGS bit1 必须为 1（启动崩溃现场 RFLAGS=0）。
+  {
+    ++total;
+    uint64_t fv = bridge.ExposeHost("flags_probe",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return 42;
+        });
+    uint64_t code_addr = base + 0x1c000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 7, 7);                    // rdi=7
+    MovRegImm64(c, 6, 5);                    // rsi=5
+    EmitCallRel32(c, code_addr, fv);         // call veneer
+    Emit(c, {0x9C});                         // pushfq
+    Emit(c, {0x58});                         // pop rax
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                         // hlt
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = (got & 0x2) != 0;              // RFLAGS bit1（保留位，恒 1）
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (flags=0x%llx)\n",
+                "sys_flags", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 启动序列复现：init_env→atexit×2→new×2（不同 ID veneer、间接 call，同启动崩溃序列）。
+  // 真实启动在第二次 new 的 syscall 返回处崩（faultaddr=0, RFLAGS=0）。
+  {
+    ++total;
+    uint64_t v_env = bridge.ExposeHost("boot_env",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return 0; });
+    uint64_t v_at = bridge.ExposeHost("boot_atexit",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return 0; });
+    static uint64_t new_ret = 0x1decd0b0;
+    uint64_t v_new = bridge.ExposeHost("boot_new",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          uint64_t r = new_ret; new_ret += 0x90; return r;
+        });
+    uint64_t got_addr = base + 0x1d000;
+    uint64_t code_addr = base + 0x1e000;
+    auto* got = reinterpret_cast<uint64_t*>(got_addr);
+    got[0] = v_env; got[1] = v_at; got[2] = v_new;
+    std::vector<uint8_t> c;
+    auto IndCall = [&](int slot) {
+      Emit(c, {0x48, 0xA1});                 // mov rax, [moffs64]
+      uint64_t a = got_addr + slot * 8;
+      for (int b = 0; b < 8; ++b) c.push_back((a >> (b * 8)) & 0xFF);
+      Emit(c, {0xFF, 0xD0});                 // call rax
+    };
+    IndCall(0);                              // _init_env
+    IndCall(1); IndCall(1);                  // atexit ×2
+    MovRegImm64(c, 7, 0x70); IndCall(2);     // new(0x70)
+    MovRegImm64(c, 7, 0x70); IndCall(2);     // new(0x70) 再次 → 启动在此崩
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t r = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = r == 0x1decd140;               // 第二次 new 的返回值
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x1decd140)\n",
+                "boot_seq", ok ? "PASS" : "FAIL", (unsigned long long)r);
+  }
+
+  // AVX256 基础：vpcmpeqd ymm0 全 1 → movq rax,xmm0（隔离 256 位 VEX 翻译）。
+  {
+    ++total;
+    uint64_t code_addr = base + 0x21000;
+    std::vector<uint8_t> c;
+    Emit(c, {0xC5, 0xFD, 0x76, 0xC0});        // vpcmpeqd ymm0, ymm0, ymm0（修正：66前缀 pp=01→C5 FD，原 C5 FE 是 F3 非法）
+    Emit(c, {0x66, 0x48, 0x0F, 0x7E, 0xC0});  // movq rax, xmm0
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0xFFFFFFFFFFFFFFFFULL;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx)\n",
+                "avx256", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // AVX256 + syscall 交互：call veneer 后 vxorps ymm0（崩溃现场调用者的下一条指令）。
+  {
+    ++total;
+    uint64_t av = bridge.ExposeHost("avx_probe",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return 42;
+        });
+    uint64_t code_addr = base + 0x22000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 7, 7);
+    MovRegImm64(c, 6, 5);
+    EmitCallRel32(c, code_addr, av);          // call veneer → rax=42
+    Emit(c, {0xC5, 0xFC, 0x57, 0xC0});        // vxorps ymm0, ymm0, ymm0
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 42;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x2a)\n",
+                "avx_sys", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 崩溃调用者完整复刻（eboot 0x493290）：push 帧 + call new + vxorps + 对象初始化 stores。
+  {
+    ++total;
+    uint64_t ret_ptr = base + 0x20000;        // 可写返回区
+    uint64_t data_addr = base + 0x1f000;
+    *reinterpret_cast<uint64_t*>(data_addr + 8) = 0xCAFE;
+    uint64_t cv = bridge.ExposeHost("caller_new",
+        [ret_ptr](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t {
+          return ret_ptr;
+        });
+    uint64_t code_addr = base + 0x23000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 7, data_addr);             // rdi = data
+    MovRegImm64(c, 2, data_addr);             // rdx = data
+    Emit(c, {0x55});                          // push rbp
+    Emit(c, {0x48, 0x89, 0xE5});              // mov rbp, rsp
+    Emit(c, {0x41, 0x57});                    // push r15
+    Emit(c, {0x41, 0x56});                    // push r14
+    Emit(c, {0x53});                          // push rbx
+    Emit(c, {0x50});                          // push rax
+    Emit(c, {0x49, 0x89, 0xFF});              // mov r15, rdi
+    Emit(c, {0xBF, 0x70, 0x00, 0x00, 0x00});  // mov edi, 0x70
+    Emit(c, {0x49, 0x89, 0xD6});              // mov r14, rdx
+    EmitCallRel32(c, code_addr, cv);          // call new veneer
+    Emit(c, {0x49, 0x8B, 0x4F, 0x08});        // mov rcx, [r15+8]
+    Emit(c, {0x48, 0x89, 0xC3});              // mov rbx, rax
+    Emit(c, {0xC5, 0xFC, 0x57, 0xC0});        // vxorps ymm0, ymm0, ymm0
+    Emit(c, {0x48, 0x89, 0x0B});              // mov [rbx], rcx
+    Emit(c, {0x48, 0x89, 0x4B, 0x08});        // mov [rbx+8], rcx
+    Emit(c, {0x48, 0x89, 0x4B, 0x10});        // mov [rbx+16], rcx
+    Emit(c, {0x66, 0xC7, 0x43, 0x18, 0x00, 0x00});  // movw [rbx+24], 0
+    Emit(c, {0x48, 0x8B, 0x03});              // mov rax, [rbx]（读回验证）
+    Emit(c, {0x48, 0x83, 0xC4, 0x20});        // add rsp,0x20（跳过 rax/rbx/r14/r15 槽——原测试漏了尾声!）
+    Emit(c, {0x5D});                          // pop rbp
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0xCAFE;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0xcafe)\n",
+                "avx_caller", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 隔离1：无 call，纯 vxorps ymm0 后读 rcx（测 vxorps 是否单独破坏 GPR）。
+  {
+    ++total;
+    uint64_t code_addr = base + 0x24000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 1, 0x1234);              // mov rcx, 0x1234
+    Emit(c, {0xC5, 0xFC, 0x57, 0xC0});      // vxorps ymm0, ymm0, ymm0
+    Emit(c, {0x48, 0x89, 0xC8});            // mov rax, rcx
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0x1234;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x1234)\n",
+                "avx_gpr", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 隔离2：call veneer + vxorps ymm0 后读 rcx（测 call+vxorps 交互）。
+  {
+    ++total;
+    uint64_t gv = bridge.ExposeHost("gpr_probe",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return 42; });
+    uint64_t code_addr = base + 0x25000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 3, 0x1234);              // rbx = 0x1234（rcx 被 syscall 设返回RIP 是正确x86行为，改用 callee-saved rbx）
+    MovRegImm64(c, 7, 7);
+    MovRegImm64(c, 6, 5);
+    EmitCallRel32(c, code_addr, gv);        // call veneer
+    Emit(c, {0xC5, 0xFC, 0x57, 0xC0});      // vxorps ymm0
+    Emit(c, {0x48, 0x89, 0xD8});            // mov rax, rbx
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0x1234;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x1234)\n",
+                "avx_callgpr", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 隔离3：avx_caller 完整序列但去掉 vxorps（对照组，定位 vxorps 是否破坏因子）。
+  {
+    ++total;
+    uint64_t ret_ptr = base + 0x20800;
+    uint64_t data_addr = base + 0x1f800;
+    *reinterpret_cast<uint64_t*>(data_addr + 8) = 0xCAFE;
+    uint64_t cv = bridge.ExposeHost("caller_novx_new",
+        [ret_ptr](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return ret_ptr; });
+    uint64_t code_addr = base + 0x26000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 7, data_addr);
+    MovRegImm64(c, 2, data_addr);
+    Emit(c, {0x55});
+    Emit(c, {0x48, 0x89, 0xE5});
+    Emit(c, {0x41, 0x57});
+    Emit(c, {0x41, 0x56});
+    Emit(c, {0x53});
+    Emit(c, {0x50});
+    Emit(c, {0x49, 0x89, 0xFF});
+    Emit(c, {0xBF, 0x70, 0x00, 0x00, 0x00});
+    Emit(c, {0x49, 0x89, 0xD6});
+    EmitCallRel32(c, code_addr, cv);
+    Emit(c, {0x49, 0x8B, 0x4F, 0x08});
+    Emit(c, {0x48, 0x89, 0xC3});
+    // 无 vxorps
+    Emit(c, {0x48, 0x89, 0x0B});
+    Emit(c, {0x48, 0x89, 0x4B, 0x08});
+    Emit(c, {0x48, 0x89, 0x4B, 0x10});
+    Emit(c, {0x66, 0xC7, 0x43, 0x18, 0x00, 0x00});
+    Emit(c, {0x48, 0x8B, 0x03});
+    Emit(c, {0x48, 0x83, 0xC4, 0x20});        // add rsp,0x20（补尾声）
+    Emit(c, {0x5D});                          // pop rbp
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0xCAFE;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0xcafe)\n",
+                "caller_novx", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 隔离A：push 帧 + 调用普通 guest 子程序（无 syscall）+ ret。测 push 帧下 call/ret 本身。
+  {
+    ++total;
+    uint64_t code_addr = base + 0x27000;
+    std::vector<uint8_t> c;
+    Emit(c, {0x53});                          // push rbx
+    Emit(c, {0x55});                          // push rbp
+    c.push_back(0xE8); size_t rel_off = c.size(); c.insert(c.end(), {0,0,0,0});  // call sub
+    Emit(c, {0x5D});                          // pop rbp
+    Emit(c, {0x5B});                          // pop rbx
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床                          // hlt
+    size_t sub_off = c.size();
+    MovRaxImm64(c, 42);                       // sub: mov rax, 42
+    Emit(c, {0xC3});                          // ret
+    int32_t rel = (int32_t)(sub_off - (rel_off + 4));
+    std::memcpy(c.data() + rel_off, &rel, 4);
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 42;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x2a)\n",
+                "push_plainret", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 隔离B：最小 push 帧（push rbx）+ syscall veneer + pop。测 push 帧 + syscall 交互。
+  {
+    ++total;
+    uint64_t pv = bridge.ExposeHost("push_sys_probe",
+        [](const uint64_t* a, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return a[0] + a[1]; });
+    uint64_t code_addr = base + 0x28000;
+    std::vector<uint8_t> c;
+    Emit(c, {0x53});                          // push rbx
+    MovRegImm64(c, 7, 7);
+    MovRegImm64(c, 6, 5);
+    EmitCallRel32(c, code_addr, pv);          // call veneer → rax=12
+    Emit(c, {0x5B});                          // pop rbx
+    Emit(c, {0xC3});  // ret 到 CALLBACKRET 蹦床
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 12;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0xc)\n",
+                "push1_sys", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 对照：先读后写 r12-r15（强制块入口 LoadRegister），验证"只写不读"是否触发 RA 错位。
+  {
+    ++total;
+    uint64_t fn_addr = base + 0x2C800;
+    uint8_t fn[] = {0x48, 0xC7, 0xC0, 0x99, 0x00, 0x00, 0x00, 0xC3};
+    std::memcpy(reinterpret_cast<void*>(fn_addr), fn, sizeof(fn));
+    uint64_t code_addr = base + 0x2C000;
+    uint64_t buf_addr = base + 0x2D000;
+    std::vector<uint8_t> c;
+    // 先读（mov rax, rN）强制 LoadRegister，再写
+    Emit(c, {0x49, 0x8B, 0xC4}); MovRegImm64(c, 12, 0x1111);  // r12
+    Emit(c, {0x49, 0x8B, 0xC5}); MovRegImm64(c, 13, 0x2222);  // r13
+    Emit(c, {0x49, 0x8B, 0xC6}); MovRegImm64(c, 14, 0x3333);  // r14
+    Emit(c, {0x49, 0x8B, 0xC7}); MovRegImm64(c, 15, 0x4444);  // r15
+    MovRegImm64(c, 3, 0x5555);
+    EmitCallRel32(c, code_addr, fn_addr);
+    MovRegImm64(c, 7, buf_addr);
+    Emit(c, {0x4C, 0x89, 0x27});
+    Emit(c, {0x4C, 0x89, 0x6F, 0x08});
+    Emit(c, {0x4C, 0x89, 0x77, 0x10});
+    Emit(c, {0x4C, 0x89, 0x7F, 0x18});
+    Emit(c, {0x48, 0x89, 0x5F, 0x20});
+    Emit(c, {0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00});
+    Emit(c, {0xC3});
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    bridge.CallGuest(code_addr, nullptr, 0);
+    auto* buf = reinterpret_cast<const uint64_t*>(buf_addr);
+    bool ok = buf[0]==0x1111 && buf[1]==0x2222 && buf[2]==0x3333 && buf[3]==0x4444 && buf[4]==0x5555;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (r12=%llx r13=%llx r14=%llx r15=%llx rbx=%llx)\n",
+                "r15_rw", ok ? "PASS" : "FAIL",
+                (unsigned long long)buf[0], (unsigned long long)buf[1], (unsigned long long)buf[2],
+                (unsigned long long)buf[3], (unsigned long long)buf[4]);
+  }
+
+  // r15 跨纯 guest call 保存隔离（不经 syscall）：判定 callret 机制是否损坏 callee-saved。
+  {
+    ++total;
+    uint64_t fn_addr = base + 0x29800;
+    uint8_t fn[] = {0x48, 0xC7, 0xC0, 0x99, 0x00, 0x00, 0x00, 0xC3};  // mov rax,0x99; ret
+    std::memcpy(reinterpret_cast<void*>(fn_addr), fn, sizeof(fn));
+    uint64_t code_addr = base + 0x2A000;
+    uint64_t buf_addr = base + 0x2B000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 12, 0x1111);
+    MovRegImm64(c, 13, 0x2222);
+    MovRegImm64(c, 14, 0x3333);
+    MovRegImm64(c, 15, 0x4444);
+    MovRegImm64(c, 3, 0x5555);              // rbx
+    auto snapshot = [&](std::vector<uint8_t>& cc, unsigned off) {
+      MovRegImm64(cc, 7, buf_addr);         // mov rdi, buf
+      Emit(cc, {0x4C, 0x89, 0x67, (uint8_t)off});        // mov [rdi+off], r12
+      Emit(cc, {0x4C, 0x89, 0x6F, (uint8_t)(off+8)});    // r13
+      Emit(cc, {0x4C, 0x89, 0x77, (uint8_t)(off+16)});   // r14
+      Emit(cc, {0x4C, 0x89, 0x7F, (uint8_t)(off+24)});   // r15
+      Emit(cc, {0x48, 0x89, 0x5F, (uint8_t)(off+32)});   // rbx
+    };
+    EmitCallRel32(c, code_addr, fn_addr);   // 第1次 call（触发块编译）
+    snapshot(c, 0);
+    MovRegImm64(c, 12, 0x1111);             // 重设
+    MovRegImm64(c, 13, 0x2222);
+    MovRegImm64(c, 14, 0x3333);
+    MovRegImm64(c, 15, 0x4444);
+    MovRegImm64(c, 3, 0x5555);
+    EmitCallRel32(c, code_addr, fn_addr);   // 第2次 call（已编译快路径）
+    snapshot(c, 48);
+    Emit(c, {0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00});  // mov rax, 0
+    Emit(c, {0xC3});                        // ret
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    bridge.CallGuest(code_addr, nullptr, 0);
+    auto* buf = reinterpret_cast<const uint64_t*>(buf_addr);
+    bool ok1 = buf[0]==0x1111 && buf[1]==0x2222 && buf[2]==0x3333 && buf[3]==0x4444 && buf[4]==0x5555;
+    bool ok2 = buf[6]==0x1111 && buf[7]==0x2222 && buf[8]==0x3333 && buf[9]==0x4444 && buf[10]==0x5555;
+    if (ok1 && ok2) ++passed;
+    std::printf("[divaft-guest] r15_call 第1次(编译): %s r12=%llx r13=%llx r14=%llx r15=%llx rbx=%llx\n",
+                ok1?"PASS":"FAIL", (unsigned long long)buf[0], (unsigned long long)buf[1],
+                (unsigned long long)buf[2], (unsigned long long)buf[3], (unsigned long long)buf[4]);
+    std::printf("[divaft-guest] r15_call 第2次(快路): %s r12=%llx r13=%llx r14=%llx r15=%llx rbx=%llx\n",
+                ok2?"PASS":"FAIL", (unsigned long long)buf[6], (unsigned long long)buf[7],
+                (unsigned long long)buf[8], (unsigned long long)buf[9], (unsigned long long)buf[10]);
+  }
+
+  // r15 跨 syscall 保存隔离：mov r15,0x1234 → call veneer → mov rax,r15。
+  {
+    ++total;
+    uint64_t rv = bridge.ExposeHost("r15_probe",
+        [](const uint64_t* a, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return a[0] + a[1]; });
+    uint64_t code_addr = base + 0x29000;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 15, 0x1234);             // mov r15, 0x1234
+    MovRegImm64(c, 7, 7);
+    MovRegImm64(c, 6, 5);
+    EmitCallRel32(c, code_addr, rv);        // call host_add
+    Emit(c, {0x4C, 0x89, 0xF8});            // mov rax, r15
+    Emit(c, {0xC3});                        // ret
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0x1234;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x1234)\n",
+                "r15_sys", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // rsi 跨 vmovups 保存：mov rsi,0x1234; vmovups xmm0,[mem]; mov rax,rsi。
+  {
+    ++total;
+    uint64_t code_addr = base + 0x2E000;
+    uint64_t mem_addr = base + 0x2E800;
+    std::vector<uint8_t> c;
+    MovRegImm64(c, 6, 0x1234);              // mov rsi, 0x1234
+    // vmovups xmm0, [mem]  via rip-rel: C5 F8 10 05 <disp32>
+    int64_t disp = (int64_t)mem_addr - (int64_t)(code_addr + c.size() + 8);
+    Emit(c, {0xC5, 0xF8, 0x10, 0x05});
+    for (int i=0;i<4;++i) c.push_back((disp>>(i*8))&0xFF);
+    Emit(c, {0x48, 0x89, 0xF0});            // mov rax, rsi
+    Emit(c, {0xC3});
+    std::memcpy(reinterpret_cast<void*>(code_addr), c.data(), c.size());
+    uint64_t got = bridge.CallGuest(code_addr, nullptr, 0);
+    bool ok = got == 0x1234;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x1234)\n",
+                "rsi_avx", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  // 判别实验：复刻 boot 空指针链 A→B→C（rsi 经 call 传入→B 存局部→C 解引用）。
+  // A: 局部计数器=0x42, call HLE(new), lea rsi=&计数器, call B。B: vmovups+mov [rbp-0x70],rsi, lea rdx, call C。
+  // C: mov r14,rdx; mov rax,[r14]; mov eax,[rax]; 存 result。期望 got=0x42。
+  {
+    ++total;
+    uint64_t A = base + 0x2F000, B = base + 0x2F800, C = base + 0x30000, R = base + 0x30800;
+    uint64_t nv = bridge.ExposeHost("chain_new",
+        [](const uint64_t*, unsigned, const double*, divaft::HleReturn*) -> uint64_t { return 0x9000000; });
+    // C
+    std::vector<uint8_t> cc;
+    Emit(cc, {0x55}); Emit(cc, {0x48,0x89,0xE5}); Emit(cc, {0x41,0x56});
+    Emit(cc, {0x49,0x89,0xD6});              // mov r14,rdx
+    Emit(cc, {0x49,0x8B,0x06});              // mov rax,[r14]
+    Emit(cc, {0x8B,0x00});                   // mov eax,[rax]
+    { int64_t d=(int64_t)R-(int64_t)(C+cc.size()+7); Emit(cc,{0x48,0x89,0x05});
+      for(int i=0;i<4;++i) cc.push_back((d>>(i*8))&0xFF); }   // mov [rip+R],rax
+    Emit(cc, {0x41,0x5E}); Emit(cc, {0x5D}); Emit(cc, {0xC3});
+    std::memcpy((void*)C, cc.data(), cc.size());
+    // B
+    std::vector<uint8_t> cb;
+    Emit(cb, {0x55}); Emit(cb, {0x48,0x89,0xE5});
+    Emit(cb, {0x41,0x57}); Emit(cb, {0x41,0x56}); Emit(cb, {0x53});
+    Emit(cb, {0x48,0x83,0xEC,0x78});         // sub rsp,0x78
+    Emit(cb, {0xC5,0xF8,0x10,0x45,0xB0});    // vmovups xmm0,[rbp-0x50]
+    Emit(cb, {0x48,0x89,0x75,0x90});         // mov [rbp-0x70],rsi
+    Emit(cb, {0x48,0x8D,0x55,0x90});         // lea rdx,[rbp-0x70]
+    EmitCallRel32(cb, B, C);
+    Emit(cb, {0x48,0x83,0xC4,0x78}); Emit(cb, {0x5B}); Emit(cb, {0x41,0x5E});
+    Emit(cb, {0x41,0x5F}); Emit(cb, {0x5D}); Emit(cb, {0xC3});
+    std::memcpy((void*)B, cb.data(), cb.size());
+    // A
+    std::vector<uint8_t> ca;
+    Emit(ca, {0x55}); Emit(ca, {0x48,0x89,0xE5}); Emit(ca, {0x48,0x83,0xEC,0x40});
+    Emit(ca, {0xC7,0x45,0xCC,0x42,0x00,0x00,0x00});  // mov dword[rbp-0x34],0x42
+    Emit(ca, {0xBF,0x70,0x00,0x00,0x00});    // mov edi,0x70
+    EmitCallRel32(ca, A, nv);                // call HLE new
+    Emit(ca, {0x48,0x8D,0x75,0xCC});         // lea rsi,[rbp-0x34]
+    Emit(ca, {0xBF,0x34,0x12,0x00,0x00});    // mov edi,0x1234
+    EmitCallRel32(ca, A, B);
+    { int64_t d=(int64_t)R-(int64_t)(A+ca.size()+7); Emit(ca,{0x48,0x8B,0x05});
+      for(int i=0;i<4;++i) ca.push_back((d>>(i*8))&0xFF); }   // mov rax,[rip+R]
+    Emit(ca, {0x48,0x83,0xC4,0x40}); Emit(ca, {0x5D}); Emit(ca, {0xC3});
+    std::memcpy((void*)A, ca.data(), ca.size());
+    uint64_t got = bridge.CallGuest(A, nullptr, 0);
+    uint64_t mem = *reinterpret_cast<const uint64_t*>(R);
+    std::fprintf(stderr, "[chain-dbg] result_buf=0x%llx got=0x%llx\n",(unsigned long long)mem,(unsigned long long)got);
+    bool ok = got == 0x42;
+    if (ok) ++passed;
+    std::printf("[divaft-guest] %-10s : %s (got=0x%llx want=0x42)\n",
+                "rsi_chain", ok ? "PASS" : "FAIL", (unsigned long long)got);
+  }
+
+  bridge.Shutdown();
+  std::printf("[divaft-guest] %s (%d/%d)\n",
+              passed == total ? "GUEST_EXEC_PASS" : "GUEST_EXEC_FAIL", passed, total);
+  return passed == total;
+}
+
+
+int main(int argc, char** argv) {
+  setvbuf(stderr, nullptr, _IONBF, 0);  // 崩溃前日志不丢
+  bool self_ok = RunSelfTests();
+  if (argc >= 2) {
+    if (!self_ok)
+      std::fprintf(stderr, "[diva-boot] 自检未全过（诊断用），继续启动 eboot\n");
+    std::fprintf(stderr, "[diva-boot] loading %s\n", argv[1]);
+    divaft::DivaRuntime rt;
+    const char* contract = argc >= 3 ? argv[2] : "";
+    const char* libc_path = argc >= 4 ? argv[3] : "";
+    if (!rt.Init(argv[1], contract, libc_path)) {
+      std::fprintf(stderr, "[diva-boot] init failed\n");
+      return 2;
+    }
+    rt.Boot();
+    std::fprintf(stderr, "[diva-boot] boot returned\n");
+    return 0;
+  }
+  return self_ok ? 0 : 1;
+}

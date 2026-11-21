@@ -1,3 +1,13 @@
+> ## ⚠️ 这是 DIVA/FTDX (CUSA08053) PS4→Android 移植工程
+>
+> 本仓库包含两套代码：根目录是 **Bloodborne 运行时引擎**（`src/`, `gpu/`, `cpu/` …），`divaft-port/` 是 **DIVA 移植工程层**（构建脚本、补丁、移交文档、contract 表）。
+>
+> **接手请先读 [`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md)**（工程接续总入口），再读 [`divaft-port/aot/docs/FTDX-移交文档.md`](divaft-port/aot/docs/FTDX-移交文档.md)（完整移交文档）。引擎原始 README 见 [`README.engine.md`](README.engine.md)。
+>
+> 当前状态：基础设施全通，尚未完全正常启动（渲染上下文 + 堆 abort 待治本）。不谎报。
+
+---
+
 <p align="center"><a href="https://paypal.me/Ducvd89"><img src="docs/donate/buy-me-a-claude-token.svg" alt="Buy me a Claude token" height="48"></a></p>
 
 <h1 align="center">Bloodborne-Android</h1>

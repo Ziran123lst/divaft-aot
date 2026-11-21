@@ -1,0 +1,19 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 63280a42a..ca22eeee1 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -860,6 +860,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     }
+   }
+ 
++  // DIVA debug: 单步下抓 RSP 错位（DIVA_RSP_ASSERT gated）
++  if (getenv("DIVA_RSP_ASSERT") && (Frame->State.gregs[FEXCore::X86State::REG_RSP] & 7) != 0) {
++    fprintf(stderr, "[RSP-ASSERT] misaligned RSP=0x%llx GuestRIP=0x%llx\n",
++            (unsigned long long)Frame->State.gregs[FEXCore::X86State::REG_RSP],
++            (unsigned long long)GuestRIP);
++    fflush(stderr);
++    __builtin_trap();
++  }
+   auto Thread = Frame->Thread;
+   FEXCORE_PROFILE_SCOPED("CompileBlock");
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
