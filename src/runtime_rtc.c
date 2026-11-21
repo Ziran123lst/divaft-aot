@@ -110,6 +110,11 @@ static ABI int32_t rtc_set_tick(DateTime *t, const uint64_t *tick) {
     if (!t || !tick) return ERR_INVALID_POINTER;
     from_tick(*tick,t); return 0;
 }
+static ABI int32_t rtc_tick_add(uint64_t *out, const uint64_t *tick, int64_t delta) {
+    if (!out || !tick) return ERR_INVALID_POINTER;
+    *out = *tick + (uint64_t)delta;
+    return 0;
+}
 static ABI uint32_t rtc_tick_resolution(void) { return 1000000; }
 static ABI int32_t rtc_set_time_t(DateTime *t, int64_t seconds) {
     if (!t) return ERR_INVALID_POINTER;
@@ -145,7 +150,7 @@ static const RuntimeExport exports[]={
     {"sceRtcGetCurrentTick",rtc_current_tick}, {"sceRtcGetCurrentNetworkTick",rtc_current_tick},
     {"sceRtcConvertUtcToLocalTime",rtc_utc_to_local}, {"sceRtcConvertLocalTimeToUtc",rtc_local_to_utc},
     {"sceRtcGetDayOfWeek",rtc_day_of_week}, {"sceRtcGetTick",rtc_get_tick}, {"sceRtcSetTick",rtc_set_tick},
-    {"sceRtcGetTickResolution",rtc_tick_resolution}, {"sceRtcSetTime_t",rtc_set_time_t},
+    {"sceRtcTickAddTicks",rtc_tick_add}, {"sceRtcGetTickResolution",rtc_tick_resolution}, {"sceRtcSetTime_t",rtc_set_time_t},
     {"sceRtcGetTime_t",rtc_get_time_t}, {"sceRtcFormatRFC2822LocalTime",rtc_rfc2822_local},
 };
 uintptr_t runtime_rtc_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }

@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MIRROR = 'https://deb.debian.org/debian'
+MIRROR = 'https://mirrors.tuna.tsinghua.edu.cn/debian'
 SUITE = 'trixie'
 # What the runtime, the GPU library and FEXCore link against (dependencies follow).
 WANTED = [

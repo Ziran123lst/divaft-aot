@@ -473,6 +473,21 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
 }
 
 static ABI uint64_t direct_size(void) { return POOL_SIZE; }
+/* libSceLibcInternalExt: the game passes a stack struct and expects it filled with
+ * libc trace handles (shadPS4 libc_internal_memory.cpp). Leaving it unwritten leaves
+ * stack garbage the game dereferences, corrupting later setup.
+ *   struct HeapInfoInfo { u64 size; u32 flag; u32 getSegmentInfo;
+ *                         u64 *mspace_atomic_id_mask; u64 *mstate_table; }; */
+static uint64_t heap_trace_atomic_id_mask;
+static uint64_t heap_trace_mstate_table[64];
+static ABI void heap_get_trace_info(void *info) {
+    if (!info) return;
+    unsigned char *p = info;
+    if (*(uint64_t *)p < 32) return; /* older/smaller struct: nothing to fill */
+    *(uint32_t *)(p + 12) = 0;
+    *(uint64_t *)(p + 16) = (uint64_t)&heap_trace_atomic_id_mask;
+    *(uint64_t *)(p + 24) = (uint64_t)heap_trace_mstate_table;
+}
 static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
@@ -742,6 +757,7 @@ static const RuntimeExport exports[]={
     {"sceKernelVirtualQuery",virtual_query}, {"sceKernelGetDirectMemoryType",direct_memory_type},
     {"sceKernelBatchMap",batch_map}, {"sceKernelBatchMap2",batch_map2},
     {"mmap",posix_mmap},
+    {"sceLibcHeapGetTraceInfo",heap_get_trace_info},
 };
 uintptr_t runtime_memory_resolve(const char *name) {
     /* Direct-memory NIDs are exercised by test_runtime.c before names are loaded. */

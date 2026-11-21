@@ -303,7 +303,12 @@ static ABI int32_t posix_key_create(uint32_t *k,KeyDestructor d) { int32_t r=key
 static ABI int32_t posix_key_delete(uint32_t k) { int32_t r=key_delete(k); return r ? r&0xffff : 0; }
 static ABI int32_t posix_key_set(uint32_t k,void *v) { int32_t r=key_set(k,v); return r ? r&0xffff : 0; }
 
+/* libSceLibcInternalExt asks whether the sanitizer is on before choosing its
+ * allocator path; the guest runs without one, so answer "no". */
+static ABI int32_t asan_enabled(void) { return 0; }
+
 static const RuntimeExport exports[]={
+    {"sceKernelIsAddressSanitizerEnabled",asan_enabled},
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
     {"sceKernelGetProcessTime",process_time}, {"sceKernelGetProcessTimeCounter",process_time_counter},

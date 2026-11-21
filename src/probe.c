@@ -146,8 +146,17 @@ static void protect(void *p, size_t size, unsigned flags) {
     runtime_low_protect((uintptr_t)p, size, mode);
 #endif
 }
-static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argument) {
+static ABI uint64_t unresolved(uint32_t id, uintptr_t argument) {
     if (id >= import_count) fail("bad import trap index");
+    if (getenv("BB_IMPORT_STUBS")) {
+        /* DIVA/FTDX mode: the game imports more than the HLE covers; return a
+         * harmless 0 (and log once) so boot continues past optional imports. */
+        static unsigned char seen[8192];
+        if (id < 8192 && !seen[id]) { seen[id] = 1;
+            fprintf(stderr, "STUB import: %s (%s) arg0=0x%llx\n", names[id],
+                    runtime_import_name(names[id]), (unsigned long long)argument); }
+        return 0;
+    }
     uintptr_t caller=guest_cpu_return_address((uintptr_t)__builtin_return_address(0))-(uintptr_t)image;
     printf("STOP: first unsupported PS4 import: %s (index %u)\n", names[id], id);
     printf("API: %s\n", runtime_import_name(names[id]));
@@ -157,7 +166,7 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
             printf("Caller in linked module %" PRIu64 " (%s): +0x%" PRIxPTR "\n",m,m==0 ? "libc.prx" : "system module",caller-modules[m].base);
     runtime_report();
     puts(entered_game ? "Original guest entry instructions executed; game initialization is incomplete." :
-                        "Native libc initialization is incomplete; game entry has not run.");
+                        "Native libc initialization has not completed; game entry has not run.");
     fflush(NULL);
     _exit(20); /* no destructors: GPU, audio and guest threads are still running */
 }
@@ -556,7 +565,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     (void)info;
     const char head[]="STOP: watchdog timeout; thread stacks:\n";
     { ssize_t written_=write(2,head,sizeof(head)-1); (void)written_; }
-    dump_frames(context);
+    thread_dump(sig, info, context);
     int dir=open("/proc/self/task",O_RDONLY|O_DIRECTORY);
     char buffer[4096];
     long n;
@@ -969,7 +978,7 @@ int main(int argc, char **argv) {
     runtime_net_image_mapped(image, size); /* online modules that read the original code */
     for (int i=0;i<patch_count;++i) apply_patches(patch_files[i], segments, ns, relocs, nr);
     if (!cpu_only) {
-        bbgpu_patch_image(image, size);
+        if (!getenv("BB_NO_GPU_PATCH")) bbgpu_patch_image(image, size);
         if (fallback_count && !bbgpu_frame_hooks_installed()) {
             printf("Frame rate: hooks not installed: the fallback patches (the game's frame rate patch) apply\n");
             for (int i=0;i<fallback_count;++i) apply_patches(fallback_files[i], segments, ns, relocs, nr);

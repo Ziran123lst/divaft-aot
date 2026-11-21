@@ -147,39 +147,101 @@ void Swapchain::CreateBuffer(u32 index) {
     const vk::Device device = instance.GetDevice();
     Buffer& buffer = buffers[index];
 
-    const AHardwareBuffer_Desc desc{
-        .width = width,
-        .height = height,
-        .layers = 1,
-        .format = AhbFormat,
-        .usage = AhbUsage,
+    // Some Turnip builds loaded directly through the HAL HMI module allocate an
+    // AHardwareBuffer fine but reject it in vkGetAndroidHardwareBufferPropertiesANDROID
+    // (VK_ERROR_INVALID_EXTERNAL_HANDLE) when it carries COMPOSER_OVERLAY, or for a
+    // particular pixel format. Try several standard (format, usage) combinations and
+    // keep the first the driver accepts. Values are copied out of the StructureChain so
+    // they stay valid after the chain goes out of scope.
+    struct AhbAttempt {
+        u32 format;
+        u64 usage;
+        const char* name;
     };
-    const int allocated = AHardwareBuffer_allocate(&desc, &buffer.ahb);
-    ASSERT_MSG(allocated == 0 && buffer.ahb, "AHardwareBuffer_allocate {}x{} failed: {}", width,
-               height, allocated);
+    static const AhbAttempt attempts[] = {
+        {AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+         AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+             AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+         "RGBA8 color+sampled+overlay"},
+        {AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+         AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+         "RGBA8 color+sampled"},
+        {AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT,
+         "RGBA8 color"},
+        {AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM,
+         AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
+         "RGBX8 color+sampled"},
+    };
 
-    auto [props_result, props_chain] = device.getAndroidHardwareBufferPropertiesANDROID<
-        vk::AndroidHardwareBufferPropertiesANDROID, vk::AndroidHardwareBufferFormatPropertiesANDROID>(
-        *buffer.ahb);
-    ASSERT_MSG(props_result == vk::Result::eSuccess,
-               "vkGetAndroidHardwareBufferPropertiesANDROID failed: {}", vk::to_string(props_result));
-    const auto& props = props_chain.get<vk::AndroidHardwareBufferPropertiesANDROID>();
-    const auto& format_props = props_chain.get<vk::AndroidHardwareBufferFormatPropertiesANDROID>();
-    ASSERT_MSG(format_props.format != vk::Format::eUndefined,
-               "The driver maps the AHardwareBuffer to no Vulkan format (external format {:#x})",
-               format_props.externalFormat);
-    const auto required = vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eBlitDst;
-    ASSERT_MSG((format_props.formatFeatures & required) == required,
-               "The driver cannot render/blit into the AHardwareBuffer format {} (features {})",
-               vk::to_string(format_props.format), vk::to_string(format_props.formatFeatures));
-    surface_format.format = format_props.format;
+    vk::DeviceSize ahb_allocation_size{};
+    u32 ahb_memory_type_bits{};
+    vk::Format ahb_vk_format{vk::Format::eUndefined};
+    vk::FormatFeatureFlags ahb_format_features{};
+    u64 ahb_external_format{};
+    bool have_props = false;
+    const char* chosen = "none";
+    for (const auto& attempt : attempts) {
+        if (buffer.ahb) {
+            AHardwareBuffer_release(buffer.ahb);
+            buffer.ahb = nullptr;
+        }
+        const AHardwareBuffer_Desc desc{
+            .width = width,
+            .height = height,
+            .layers = 1,
+            .format = attempt.format,
+            .usage = attempt.usage,
+        };
+        const int allocated = AHardwareBuffer_allocate(&desc, &buffer.ahb);
+        if (allocated != 0 || !buffer.ahb) {
+            std::fprintf(stderr, "AHB swapchain [%u]: %s: allocate failed (%d)\n", index,
+                         attempt.name, allocated);
+            continue;
+        }
+        auto [props_result, props_chain] = device.getAndroidHardwareBufferPropertiesANDROID<
+            vk::AndroidHardwareBufferPropertiesANDROID,
+            vk::AndroidHardwareBufferFormatPropertiesANDROID>(*buffer.ahb);
+        if (props_result != vk::Result::eSuccess) {
+            std::fprintf(stderr, "AHB swapchain [%u]: %s: getProperties failed (%s)\n", index,
+                         attempt.name, vk::to_string(props_result).c_str());
+            continue;
+        }
+        const auto& props = props_chain.get<vk::AndroidHardwareBufferPropertiesANDROID>();
+        const auto& format_props = props_chain.get<vk::AndroidHardwareBufferFormatPropertiesANDROID>();
+        if (format_props.format == vk::Format::eUndefined) {
+            std::fprintf(stderr, "AHB swapchain [%u]: %s: no Vulkan format (external %#llx)\n",
+                         index, attempt.name, (unsigned long long)format_props.externalFormat);
+            continue;
+        }
+        const auto required =
+            vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eBlitDst;
+        if ((format_props.formatFeatures & required) != required) {
+            std::fprintf(stderr, "AHB swapchain [%u]: %s: format %s lacks render/blit features\n",
+                         index, attempt.name, vk::to_string(format_props.format).c_str());
+            continue;
+        }
+        ahb_allocation_size = props.allocationSize;
+        ahb_memory_type_bits = props.memoryTypeBits;
+        ahb_vk_format = format_props.format;
+        ahb_format_features = format_props.formatFeatures;
+        ahb_external_format = format_props.externalFormat;
+        chosen = attempt.name;
+        have_props = true;
+        break;
+    }
+    ASSERT_MSG(have_props,
+               "No AHardwareBuffer (format,usage) combination is importable by this Vulkan driver");
+    std::fprintf(stderr, "AHB swapchain [%u]: using %s -> VkFormat %s (external %#llx)\n", index,
+                 chosen, vk::to_string(ahb_vk_format).c_str(),
+                 (unsigned long long)ahb_external_format);
+    surface_format.format = ahb_vk_format;
 
     vk::ImageUsageFlags usage =
         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
-    if (format_props.formatFeatures & vk::FormatFeatureFlagBits::eTransferSrc) {
+    if (ahb_format_features & vk::FormatFeatureFlagBits::eTransferSrc) {
         usage |= vk::ImageUsageFlagBits::eTransferSrc;
     }
-    if (format_props.formatFeatures & vk::FormatFeatureFlagBits::eSampledImage) {
+    if (ahb_format_features & vk::FormatFeatureFlagBits::eSampledImage) {
         usage |= vk::ImageUsageFlagBits::eSampled;
     }
     const vk::ExternalMemoryImageCreateInfo external_info{
@@ -188,7 +250,7 @@ void Swapchain::CreateBuffer(u32 index) {
     const vk::ImageCreateInfo image_info{
         .pNext = &external_info,
         .imageType = vk::ImageType::e2D,
-        .format = format_props.format,
+        .format = ahb_vk_format,
         .extent = {width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -206,7 +268,7 @@ void Swapchain::CreateBuffer(u32 index) {
     const auto memory_properties = instance.GetPhysicalDevice().getMemoryProperties();
     u32 memory_type = ~0u;
     for (u32 i = 0; i < memory_properties.memoryTypeCount; ++i) {
-        if (!(props.memoryTypeBits & (1u << i))) {
+        if (!(ahb_memory_type_bits & (1u << i))) {
             continue;
         }
         if (memory_type == ~0u) {
@@ -218,7 +280,7 @@ void Swapchain::CreateBuffer(u32 index) {
         }
     }
     ASSERT_MSG(memory_type != ~0u, "No memory type for the AHardwareBuffer (bits {:#x})",
-               props.memoryTypeBits);
+               ahb_memory_type_bits);
     const vk::MemoryDedicatedAllocateInfo dedicated{.image = image};
     const vk::ImportAndroidHardwareBufferInfoANDROID import_info{
         .pNext = &dedicated,
@@ -226,7 +288,7 @@ void Swapchain::CreateBuffer(u32 index) {
     };
     auto [memory_result, memory] = device.allocateMemory({
         .pNext = &import_info,
-        .allocationSize = props.allocationSize,
+        .allocationSize = ahb_allocation_size,
         .memoryTypeIndex = memory_type,
     });
     ASSERT_MSG(memory_result == vk::Result::eSuccess, "Failed to import the AHardwareBuffer: {}",
@@ -239,7 +301,7 @@ void Swapchain::CreateBuffer(u32 index) {
     auto [view_result, view] = device.createImageView({
         .image = image,
         .viewType = vk::ImageViewType::e2D,
-        .format = format_props.format,
+        .format = ahb_vk_format,
         .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
                              .levelCount = 1,
                              .layerCount = 1},

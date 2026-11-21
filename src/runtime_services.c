@@ -88,6 +88,11 @@ static ABI int32_t system_status(unsigned char *status) {
     memset(status,0,12); /* event_num=0, no overlay, foreground, normal CPU mode */
     return 0;
 }
+static ABI int32_t system_safe_area(float *ratio) {
+    if (!ratio) return SYSTEM_PARAMETER;
+    *ratio = 1.0f;
+    return 0;
+}
 static ABI int32_t system_event(void *event) { (void)event; return SYSTEM_NO_EVENT; }
 static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
 static ABI int32_t launch_browser(void) { note("SystemService: web browser request ignored (offline)"); return 0; }
@@ -399,6 +404,7 @@ static const RuntimeExport exports[]={
     {"sceUserServiceInitialize",user_initialize}, {"sceUserServiceTerminate",user_terminate},
     {"sceUserServiceGetInitialUser",user_initial}, {"sceUserServiceGetLoginUserIdList",user_list},
     {"sceUserServiceGetUserName",user_name}, {"sceUserServiceGetEvent",user_event},
+    {"sceSystemServiceGetDisplaySafeAreaInfo",system_safe_area},
     {"sceSystemServiceParamGetInt",system_param}, {"sceSystemServiceGetStatus",system_status},
     {"sceSystemServiceReceiveEvent",system_event}, {"sceSystemServiceHideSplashScreen",hide_splash},
     {"sceSystemServiceLaunchWebBrowser",launch_browser},

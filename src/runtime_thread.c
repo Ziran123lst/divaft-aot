@@ -371,6 +371,8 @@ static int32_t posix(int32_t r) { return r ? (int32_t)((uint32_t)r&0xffff) : 0; 
 static ABI int32_t posix_attr_init(ThreadAttr **a) { return posix(attr_init(a)); }
 static ABI int32_t posix_attr_destroy(ThreadAttr **a) { return posix(attr_destroy(a)); }
 static ABI int32_t posix_attr_set_detach(ThreadAttr **a,int s) { return posix(attr_set_detach(a,s)); }
+static ABI int32_t posix_attr_get_stack(ThreadAttr **a,uint64_t *s) { return posix(attr_get_stack(a,s)); }
+static ABI int32_t posix_attr_get_param(ThreadAttr **a,int *p) { return posix(attr_get_param(a,p)); }
 static ABI int32_t posix_attr_set_stack(ThreadAttr **a,uint64_t s) { return posix(attr_set_stack(a,s)); }
 static ABI int32_t posix_attr_set_param(ThreadAttr **a,const int *p) { return posix(attr_set_param(a,p)); }
 static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg) { return posix(create(t,a,e,arg,"posix",0)); }
@@ -418,6 +420,8 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"E+tyo3lp5Lw#I#J",posix_attr_set_detach}, {"2Q0z6rnBrTE#I#J",posix_attr_set_stack},
         {"euKRgm0Vn2M#I#J",posix_attr_set_param}, {"OxhIB8LB-PQ#I#J",posix_create},
         {"Jmi+9w9u0E4#I#J",posix_create_name}, {"h9CcP3J0oVM#I#J",posix_join},
+        {"-fA+7ZlGDQs#libkernel",posix_attr_get_stack},
+        {"FXPWHNk8Of0#libkernel",posix_attr_get_param},
         {"FJrT5LuUBAU#I#J",thread_exit},
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
