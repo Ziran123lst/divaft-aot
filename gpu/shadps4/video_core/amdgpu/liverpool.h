@@ -265,8 +265,11 @@ public:
     };
 
 private:
+    /// nested_ib: the buffer is an indirect buffer of the current submission — its draws
+    /// use the draw preparation too (its scanner and workers walk nested buffers), while
+    /// Begin/EndSubmission stay with the top-level buffer (seq != NoSeq).
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq,
-                         std::shared_ptr<SubmittedCopy> copy = {});
+                         std::shared_ptr<SubmittedCopy> copy = {}, bool nested_ib = false);
     /// After a copied submission is decoded: whether the guest changed its command buffers since.
     static void CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq);
     Task ProcessCeUpdate(std::span<const u32> ccb);

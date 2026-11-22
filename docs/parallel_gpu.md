@@ -133,7 +133,32 @@ What remains on the GPU thread is mostly work on shared cache state: texture bin
 cache mutation and barriers; a second ordered stage builds descriptor writes and vertex
 input state from the resolved handles.
 
-## Scaling to the available threads (2026-09-30)
+## Nested indirect buffers and phone scheduling (2026-11-22, DIVA)
+
+DIVA (CUSA08053, Snapdragon 7+ Gen 3) used ~40% of its prepared draws, where Bloodborne on
+PC uses 97–98%. Two systematic causes were found and fixed:
+
+- **Nested IndirectBuffers.** Bloodborne submits none ("Nested IndirectBuffer: none"
+  above), so the scanner and workers walked only the top-level buffer. DIVA's engine nests:
+  the register writes inside an IB fold into the GPU thread's running checksum but not into
+  the scanner's, so every checksum after the first IB diverged and every nested draw went
+  unprepared. `ForEachPacket` (vk_draw_prep.cpp) now recurses into indirect buffers in
+  stream order (depth ≤ 4, 1M-dword budget per buffer, `BB_PREP_IB=0` restores the flat
+  walk), and a nested `ProcessGraphics` consumes the same submission's prepared draws
+  (`nested_ib`). IB bodies are guest memory read speculatively: a torn read only produces a
+  checksum/flat mismatch, which the GPU thread handles on the regular path.
+- **Scanner starvation.** The scanner is the serial feeder of every worker but ran
+  SCHED_IDLE like them; with the game's threads saturating all 8 cores the GPU thread
+  rebased past its queue (`scanner rebases` in the stats) and most buffers were never
+  scanned. It now runs at normal priority — it costs a few percent of one core —
+  (`BB_SCANNER_IDLE=1` restores SCHED_IDLE); workers stay SCHED_IDLE. Default workers
+  went from half to three quarters of the hardware threads (phone: 4 → 6).
+
+The stats line now splits the misses (`not ready` = workers late, `unavailable` = worker
+gave up, `checksum` = state the workers cannot reproduce, `stale` = guest memory changed
+underneath them), so the next bottleneck shows itself instead of being guessed at.
+
+
 
 Draw preparation used to replay the whole command stream in every worker and was switched
 off below 12 hardware threads (Steam Deck: no workers). Now:

@@ -533,8 +533,14 @@ bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
 }
 
 const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& prepared) {
-    if (prepared.state.load(std::memory_order_acquire) != PreparedDraw::Ready ||
-        prepared.reg_checksum != liverpool->gfx_reg_checksum) {
+    const u32 state = prepared.state.load(std::memory_order_acquire);
+    if (state != PreparedDraw::Ready) {
+        NotePreparedMiss(state == PreparedDraw::Pending ? PreparedMiss::NotReady
+                                                        : PreparedMiss::Unavailable);
+        return nullptr;
+    }
+    if (prepared.reg_checksum != liverpool->gfx_reg_checksum) {
+        NotePreparedMiss(PreparedMiss::Checksum);
         return nullptr;
     }
     // Same registers; the stage programs and their flattened user data (which also covers
@@ -546,10 +552,12 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage.hw_stage));
         // bbport: not a whole program now: the regular path decides (LooksLikeProgram).
         if (!pgm || !pgm->Address<u32*>() || !AmdGpu::DirectBinaryInfo(pgm->Address<u32*>())) {
+            NotePreparedMiss(PreparedMiss::Stale);
             return nullptr;
         }
         const auto params = AmdGpu::GetParams(*pgm);
         if (params.hash != stage.hash) {
+            NotePreparedMiss(PreparedMiss::Stale);
             return nullptr;
         }
         auto& info = const_cast<Program*>(stage.program)->info;
@@ -559,6 +567,7 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         if (info.pgm_base != stage.pgm_base || info.flattened_ud_buf.size() != stage.flat_size ||
             std::memcmp(info.flattened_ud_buf.data(), stage.flat,
                         stage.flat_size * sizeof(u32)) != 0) {
+            NotePreparedMiss(PreparedMiss::Stale);
             return nullptr;
         }
     }

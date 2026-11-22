@@ -26,9 +26,30 @@ bool IsDirectDraw(AmdGpu::PM4ItOpcode opcode) {
            opcode == PM4ItOpcode::DrawIndexAuto;
 }
 
-/// Walks the type-3 packets of a command buffer (type-2 padding skipped).
+/// bbport: nested indirect buffers are walked too (BB_PREP_IB=0 restores flat walking).
+/// Bloodborne submits none, but other engines (DIVA) do: the GPU thread runs a nested
+/// ProcessGraphics for them, so their register writes fold into the running checksum and
+/// their direct draws consume prepared draws. Walking them flat made every checksum after
+/// the first IndirectBuffer diverge and left nested draws unprepared. The bodies are guest
+/// memory read speculatively: torn or stale reads only make the prepared draw mismatch,
+/// which the GPU thread detects and handles on the regular path.
+inline bool PrepareIbEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PREP_IB");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+struct PacketWalk {
+    u32 depth = 0;
+    size_t budget = 1 << 20; ///< nested dwords per top-level buffer (runaway guard)
+};
+
+/// Walks the type-3 packets of a command buffer (type-2 padding skipped), recursing into
+/// indirect buffers in stream order.
 template <typename Func>
-void ForEachPacket(std::span<const u32> commands, Func&& func) {
+void ForEachPacket(std::span<const u32> commands, Func&& func, PacketWalk& walk) {
     for (size_t at = 0; at < commands.size();) {
         const auto* header = reinterpret_cast<const AmdGpu::PM4Header*>(commands.data() + at);
         if (header->type == 2) {
@@ -43,8 +64,25 @@ void ForEachPacket(std::span<const u32> commands, Func&& func) {
             return;
         }
         func(header);
+        if (walk.depth < 4 && PrepareIbEnabled() &&
+            header->type3.opcode == AmdGpu::PM4ItOpcode::IndirectBuffer) {
+            const auto* ib = reinterpret_cast<const AmdGpu::PM4CmdIndirectBuffer*>(header);
+            if (const auto* body = ib->Address<const u32>(); body && ib->ib_size) {
+                const size_t nested = std::min<size_t>(ib->ib_size, walk.budget);
+                walk.budget -= nested;
+                ++walk.depth;
+                ForEachPacket({body, nested}, func, walk);
+                --walk.depth;
+            }
+        }
         at += words;
     }
+}
+
+template <typename Func>
+void ForEachPacket(std::span<const u32> commands, Func&& func) {
+    PacketWalk walk;
+    ForEachPacket(commands, std::forward<Func>(func), walk);
 }
 
 u32 DefaultWorkerCount() {
@@ -52,8 +90,9 @@ u32 DefaultWorkerCount() {
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
     }
     // Workers are SCHED_IDLE and claim whole buffers, so more of them only use more idle
-    // cores: half the hardware threads (Steam Deck 4, 16-thread desktop 8).
-    return std::clamp<u32>(BbThreads::Available() / 2, 1, 8);
+    // cores. On an 8-thread phone half is 4, which starved the queue once the game threads
+    // took the big cores: three quarters (phone 6, Steam Deck 6, 16-thread desktop 8).
+    return std::clamp<u32>(BbThreads::Available() * 3 / 4, 1, 8);
 }
 
 /// Flattened user data of one submission: chunks never move, so the GPU thread can read a
@@ -228,9 +267,14 @@ std::shared_ptr<DrawPreparation::Submission> DrawPreparation::Build(
     }
     auto submission = std::make_shared<Submission>();
     submission->commands.assign(commands.begin(), commands.end());
+    bool has_ib = false;
     ForEachPacket(submission->commands, [&](const AmdGpu::PM4Header* header) {
         submission->num_draws += IsDirectDraw(header->type3.opcode);
+        has_ib |= header->type3.opcode == AmdGpu::PM4ItOpcode::IndirectBuffer;
     });
+    if (has_ib) {
+        ib_submissions.fetch_add(1, std::memory_order_relaxed);
+    }
     submission->draws = std::make_unique<PreparedDraw[]>(submission->num_draws);
     return submission;
 }
@@ -326,7 +370,17 @@ void DrawPreparation::Collect() {
 
 void DrawPreparation::ScannerLoop(std::stop_token stop) {
     Common::SetCurrentThreadName("bb:DrawScan");
-    BbThreads::MakeBackground();
+    // The scanner is the serial feeder of every worker: on a phone whose cores the game
+    // threads saturate, SCHED_IDLE starved it, the GPU thread rebased past its queue and
+    // most draws went unprepared. It costs a few percent of one core, so it runs at normal
+    // priority (BB_SCANNER_IDLE=1 restores SCHED_IDLE). Workers stay SCHED_IDLE.
+    static const bool idle = [] {
+        const char* env = std::getenv("BB_SCANNER_IDLE");
+        return env && env[0] == '1';
+    }();
+    if (idle) {
+        BbThreads::MakeBackground();
+    }
     std::unique_ptr<AmdGpu::Regs> regs;
     u64 checksum = 0;
     u64 next_seq = 0;
@@ -483,6 +537,14 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     }
 }
 
+namespace {
+std::array<std::atomic<u64>, size_t(PreparedMiss::_Count)> prepared_misses{};
+} // namespace
+
+void NotePreparedMiss(PreparedMiss reason) {
+    prepared_misses[size_t(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void DrawPreparation::Count(bool was_used) {
     ++(was_used ? used : unused);
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
@@ -496,10 +558,19 @@ void DrawPreparation::Count(bool was_used) {
         return;
     }
     window = now;
-    std::printf("Draw preparation: %llu prepared pipelines used, %llu not (%u workers, "
-                "%llu scanner rebases)\n",
+    const auto miss = [](PreparedMiss reason) {
+        return prepared_misses[size_t(reason)].exchange(0, std::memory_order_relaxed);
+    };
+    std::printf("Draw preparation: %llu prepared pipelines used, %llu not (not ready %llu, "
+                "unavailable %llu, checksum %llu, stale %llu; %u workers, "
+                "%llu scanner rebases, %llu submissions with IB)\n",
                 static_cast<unsigned long long>(used), static_cast<unsigned long long>(unused),
-                worker_count, static_cast<unsigned long long>(rebases));
+                static_cast<unsigned long long>(miss(PreparedMiss::NotReady)),
+                static_cast<unsigned long long>(miss(PreparedMiss::Unavailable)),
+                static_cast<unsigned long long>(miss(PreparedMiss::Checksum)),
+                static_cast<unsigned long long>(miss(PreparedMiss::Stale)), worker_count,
+                static_cast<unsigned long long>(rebases),
+                static_cast<unsigned long long>(ib_submissions.exchange(0)));
     used = unused = 0;
 }
 
