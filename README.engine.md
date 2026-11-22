@@ -1,3 +1,7 @@
+> **说明**：本文件是 fork 来源 [Bloodborne-Android](https://github.com/ducvd89/Bloodborne-Android) 的**引擎原始 README**，保留作参考。本项目（DIVA/FTDX 移植）请先看根目录的 [`README.md`](README.md) 与 [`CURRENT_SITUATION.md`](CURRENT_SITUATION.md)。
+
+---
+
 <p align="center"><a href="https://paypal.me/Ducvd89"><img src="docs/donate/buy-me-a-claude-token.svg" alt="Buy me a Claude token" height="48"></a></p>
 
 <h1 align="center">Bloodborne-Android</h1>
