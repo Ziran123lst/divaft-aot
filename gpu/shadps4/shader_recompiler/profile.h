@@ -19,6 +19,8 @@ struct Profile {
     bool support_int64{};
     bool support_float16{};
     bool support_float64{};
+    /// bbport: relax strict IEEE float semantics so Adreno can fuse multiply-add (shadPS4 #5455).
+    bool fast_shader_math{};
     bool supports_denorm_behavior_independence{};
     bool supports_rounding_mode_independence{};
     bool support_fp16_denorm_preserve{};

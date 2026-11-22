@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -422,7 +423,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .buffer_copy_shader_hash = Game::BufferCopyShader(),
         // bbport: another aspect ratio than 16:9 (part of the profile the shader cache is checked against).
         .ui_edge_stretch = BbDisplay::NonNative(),
+        // bbport fast math (shadPS4 PR #5455): default on, BB_FAST_MATH=0 restores strict IEEE.
+        .fast_shader_math = [] {
+            if (const char* env = std::getenv("BB_FAST_MATH")) {
+                return env[0] != '0';
+            }
+            return true;
+        }(),
     };
+    std::printf("Shader float mode: %s (BB_FAST_MATH=0 to use strict NoContraction/Inf-NaN preserve)\n",
+                profile.fast_shader_math ? "fast" : "strict");
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
