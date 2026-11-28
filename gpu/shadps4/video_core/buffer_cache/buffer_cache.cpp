@@ -1576,7 +1576,10 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::CommandWriteTarget(VAd
     return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
 }
 
-std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size,
+                                                               u32& omitted_prefix) {
+    const u32 requested_prefix = omitted_prefix;
+    omitted_prefix = 0;
     BbTexHome::BeforeAccess(device_addr, size); // bbport BB_TEX_HOME
     // bbport BB_GUEST_IN_PLACE: texture data is read by the GPU from the game's memory itself:
     // through the arena where it is bound in place, else (BB_CHUNK_TEXTURES) from its guest
@@ -1635,8 +1638,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
             return {arena, arena->Offset(device_addr)};
         }
     }
-    TraceBinding(device_addr, size, false, 9);
-    return ObtainSnapshot(device_addr, size);
+    // Only this fallback snapshots guest memory into a fresh staging buffer. Keep the full
+    // region above for GPU-written, resident and shared memory selection/coherency checks.
+    if (requested_prefix < size) {
+        omitted_prefix = requested_prefix;
+    }
+    TraceBinding(device_addr + omitted_prefix, size - omitted_prefix, false, 9);
+    return ObtainSnapshot(device_addr + omitted_prefix, size - omitted_prefix);
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainSnapshot(VAddr device_addr, u32 size) {

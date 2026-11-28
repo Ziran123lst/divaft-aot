@@ -143,7 +143,19 @@ s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
     // bbport: with the frame rate free (bbport_frame_rate) a frame is shown as soon as it comes;
     // the game asks for every second vblank (30 FPS).
-    driver->GetPort(handle)->flip_rate = BbFrameRate::Unlocked() ? 0 : rate;
+    // v3.7: DIVA port has no BB-recomp high-FPS hook (0 sites, pacer code mismatch), so
+    // BbFrameRate::Unlocked() is always false and the game's flip_rate=1 locks presentation to
+    // every-2nd-vblank = 30 FPS; it also makes the present loop skip the immediate-flip fast path
+    // (driver.cpp: !immediate_flips || flip_rate!=0), which stalls guest submits on the EOP signal.
+    // BB_FORCE_FLIP0 (default ON) forces flip_rate=0 = the driver's own default = present every
+    // vblank. This does NOT touch the submit/wait path (no v3.5 deadlock) and needs no AOT hook.
+    // Set BB_FORCE_FLIP0=0 to fall back to the game's requested rate.
+    static const bool force_flip0 = EmulatorSettingsImpl::Flag("BB_FORCE_FLIP0", true);
+    const s32 unlocked = BbFrameRate::Unlocked() ? 1 : 0;
+    const s32 applied = (force_flip0 || unlocked) ? 0 : rate;
+    driver->GetPort(handle)->flip_rate = applied;
+    LOG_INFO(Lib_VideoOut, "SetFlipRate: game_rate={} unlocked={} force_flip0={} -> flip_rate={}",
+             rate, unlocked, force_flip0 ? 1 : 0, applied);
     return ORBIS_OK;
 }
 

@@ -228,7 +228,7 @@ void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::Descript
 
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
                                                        u64 in_offset, const ImageInfo& info,
-                                                       u32 first_level) {
+                                                       u32 first_level, u32 omitted_prefix) {
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
     }
@@ -243,6 +243,9 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip + first_level];
+        // The shader's tiled offsets are relative to its input descriptor, which can now
+        // start at the first retained level. The linear output layout does not change.
+        mip_info.offset -= omitted_prefix;
         if (info.props.is_block) {
             mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
@@ -260,10 +263,11 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     scheduler.EndRendering();
     runtime.FlushBarriers();
 
+    const u64 input_bytes = info.guest_size - omitted_prefix;
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
         .offset = in_offset,
-        .range = info.guest_size,
+        .range = input_bytes,
     };
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),

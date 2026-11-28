@@ -127,6 +127,16 @@ static int valid_name(const char *name, size_t max) {
     for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
     return 1;
 }
+/* shadPS4 accepts an EMPTY dirName in sceSaveDataMount2 (it is just used as the
+ * sub-directory name; "" means mount the title's save root).  Games like DIVA
+ * use an empty dirName for their single global save.  Delete/search keep the
+ * strict valid_name above; only mount uses this relaxed check. */
+static int valid_mount_name(const char *name, size_t max) {
+    size_t n=strnlen(name,max);
+    if (n==max) return 0;            /* unterminated */
+    for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
+    return 1;                         /* n==0 (empty) is legal for mount */
+}
 /* A whole file replaced in one rename (a crash mid-write keeps the old one). */
 static int write_atomic(const char *path, const void *data, size_t size) {
     char temp[760]; snprintf(temp,sizeof(temp),"%s.bbtmp",path);
@@ -156,21 +166,35 @@ static int remove_entry(const char *path, const struct stat *st, int flag, struc
     (void)st; (void)flag; (void)ftw; return remove(path);
 }
 
-static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
+/* Trace every sceSaveData* call with its return value so a failing load can be
+ * attributed to the exact API/argument instead of guessing.  Cheap: only fires
+ * on the handful of calls a title makes around a save dialog. */
+static int32_t trace_ret(const char *api,int32_t r) {
+    printf("Runtime: sceSaveData TRACE %-28s -> 0x%08x\n",api,(uint32_t)r);
+    return r;
+}
+static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return trace_ret("Initialize",0); }
 static ABI int32_t save_terminate(void) {
-    if (!initialized) return ERR_NOT_INITIALIZED;
-    initialized=0; return 0;
+    if (!initialized) return trace_ret("Terminate",ERR_NOT_INITIALIZED);
+    initialized=0; return trace_ret("Terminate",0);
 }
 static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (user<0) return ERR_INVALID_USER;
-    if (!dir || !result || !valid_name(dir->data,sizeof(dir->data))) return ERR_PARAMETER;
+    if (!dir || !result || !valid_mount_name(dir->data,sizeof(dir->data))) {
+        printf("Runtime: sceSaveData TRACE mount REJECT dir=%p result=%p name='%s' valid=%d\n",
+               (void*)dir,(void*)result,dir?dir->data:"(null)",
+               dir?(int)valid_mount_name(dir->data,sizeof(dir->data)):0);
+        return ERR_PARAMETER;
+    }
     char base[600], host[640], meta[680];
     root(user,title,base,sizeof(base));
     snprintf(host,sizeof(host),"%s/%s",base,dir->data);
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,dir->data);
     struct stat st;
     int exists=!stat(host,&st) && S_ISDIR(st.st_mode);
+    printf("Runtime: sceSaveData TRACE mount dir='%s' mode=0x%x exists=%d base='%s'\n",
+           dir->data,mode,exists,base);
     if ((mode & MODE_CREATE) && exists) return ERR_EXISTS;
     if (!(mode & (MODE_CREATE|MODE_CREATE2)) && !exists) return ERR_NOT_FOUND;
     pthread_mutex_lock(&lock);
@@ -198,12 +222,16 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     return 0;
 }
 static ABI int32_t save_mount(const Mount1 *m, MountResult *result) {
-    if (!m) return ERR_PARAMETER;
-    return mount(m->user,m->title ? m->title->data : NULL,m->dir,m->mode,result);
+    if (!m) return trace_ret("Mount",ERR_PARAMETER);
+    printf("Runtime: sceSaveData TRACE Mount user=%d title='%s' dir='%s' mode=0x%x\n",
+           m->user,m->title?m->title->data:"(null)",m->dir?m->dir->data:"(null)",m->mode);
+    return trace_ret("Mount",mount(m->user,m->title ? m->title->data : NULL,m->dir,m->mode,result));
 }
 static ABI int32_t save_mount2(const Mount2 *m, MountResult *result) {
-    if (!m) return ERR_PARAMETER;
-    return mount(m->user,NULL,m->dir,m->mode,result);
+    if (!m) return trace_ret("Mount2",ERR_PARAMETER);
+    printf("Runtime: sceSaveData TRACE Mount2 user=%d dir='%s' mode=0x%x\n",
+           m->user,m->dir?m->dir->data:"(null)",m->mode);
+    return trace_ret("Mount2",mount(m->user,NULL,m->dir,m->mode,result));
 }
 static int slot_of(const MountPoint *point) {
     if (!point || strncmp(point->data,"/savedata",9)) return -1;
@@ -284,7 +312,10 @@ static int compare(const void *a, const void *b) {
 }
 static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!cond || !result) return ERR_PARAMETER;
+    if (!cond || !result) {
+        printf("Runtime: sceSaveData TRACE DirNameSearch NULL cond=%p result=%p\n",(void*)cond,(void*)result);
+        return ERR_PARAMETER;
+    }
     char base[600];
     root(cond->user,cond->title ? cond->title->data : NULL,base,sizeof(base));
     Entry *entries=NULL; size_t count=0, capacity=0;
@@ -316,7 +347,10 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
 /* SaveDataMemory: one fixed-size blob per user/title. */
 static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!size) return ERR_PARAMETER;
+    if (!size) {
+        printf("Runtime: sceSaveData TRACE SetupSaveDataMemory size=0 (PARAMETER)\n");
+        return ERR_PARAMETER;
+    }
     char base[600], dir[640];
     root(user,NULL,base,sizeof(base));
     snprintf(dir,sizeof(dir),"%s.memory",base);

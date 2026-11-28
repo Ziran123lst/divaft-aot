@@ -684,8 +684,15 @@ void VideoOutDriver::Flip(const Request& req) {
         static std::vector<double> intervals;
         intervals.push_back(frame_ms);
         last = now;
-        // Stall diagnostics: what happened during a long frame.
+        // Sample the verbose stall dump, not the frame timings. At <25 FPS the former
+        // emitted a multi-line block on nearly every flip, on the video-out thread.
+        static const bool all_stalls = EmulatorSettingsImpl::Flag("BB_STALL_VERBOSE", false);
+        static u32 slow_frames = 0, stall_samples = 0;
         static u64 last_gpu_ns, last_images, last_image_bytes, last_buffer_bytes;
+        const bool slow = frame_ms > 40.0 && last_gpu_ns != 0;
+        slow_frames += slow;
+        const bool report_stall = slow && (all_stalls || stall_samples < 3);
+        stall_samples += report_stall;
         static u64 last_t[6], last_minflt, last_sigf, last_pc, last_pp, last_rc, last_rp;
         const u64 pc = BbStats::protect_calls.load(), pp = BbStats::protect_pages.load(),
                   rc = BbStats::protect_revoke_calls.load(), rp = BbStats::protect_revoke_pages.load();
@@ -696,7 +703,7 @@ void VideoOutDriver::Flip(const Request& req) {
         static u64 last_proc_flt, last_copy_ns, last_copy_bytes, last_rf, last_trf, last_twf;
         const u64 rf = BbStats::read_faults.load(), trf = BbStats::t_read_faults.load(),
                   twf = BbStats::t_write_faults.load();
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
+        if (report_stall) {
             std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms\n",
                         static_cast<unsigned long long>(rf - last_rf), (trf - last_trf) / 1e6,
                         (twf - last_twf) / 1e6);
@@ -726,7 +733,7 @@ void VideoOutDriver::Flip(const Request& req) {
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
+        if (report_stall) {
             std::printf("Stall: %.1f ms frame; GPU thread on CPU %.1f ms; %llu images registered, "
                         "%.1f MB image uploads, %.1f MB buffer uploads\n",
                         frame_ms, (gpu_ns - last_gpu_ns) / 1e6,
@@ -741,7 +748,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         (sys_us - last_sys) / 1e3, static_cast<unsigned long long>(invol - last_invol),
                         static_cast<unsigned long long>(vol - last_vol));
         }
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
+        if (report_stall) {
             std::printf("       ms in: resident %.1f, protect %.1f, image create %.1f, "
                         "image refresh %.1f, staging %.1f, waiting for host copies %.1f\n",
                         (t_now[0] - last_t[0]) / 1e6, (t_now[1] - last_t[1]) / 1e6,
@@ -756,7 +763,7 @@ void VideoOutDriver::Flip(const Request& req) {
         }
         const u64 mprotects = BbStats::layer_mprotects.load(std::memory_order_relaxed);
         const u64 entries = BbStats::layer_entries_written.load(std::memory_order_relaxed);
-        if (frame_ms > 40.0 && last_gpu_ns != 0 && layer_now != last_layer) {
+        if (report_stall && layer_now != last_layer) {
             const auto ms = [&](size_t i) { return (layer_now[i] - last_layer[i]) / 1e6; };
             std::printf("       layer memory ms: traps set/cleared %.1f (%llu mprotect), "
                         "to VRAM %.1f, back in place %.1f, trap hits %.1f, yield %.1f, "
@@ -770,7 +777,7 @@ void VideoOutDriver::Flip(const Request& req) {
         last_layer = layer_now;
         last_mprotects = mprotects;
         last_entries = entries;
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
+        if (report_stall) {
             std::printf("       GPU thread page faults %llu (process %llu), protection faults %llu; "
                         "protect calls %llu (%llu pages), of which write-revoking %llu (%llu pages)\n",
                         static_cast<unsigned long long>(minflt - last_minflt),
@@ -786,7 +793,7 @@ void VideoOutDriver::Flip(const Request& req) {
         last_rc = rc;
         last_rp = rp;
         last_minflt = minflt;
-        if (frame_ms > 40.0 && last_gpu_ns != 0 && copy_ns > last_copy_ns) {
+        if (report_stall && copy_ns > last_copy_ns) {
             std::printf("       guest copies %.1f MB in %.1f thread-ms, %.1f ms on CPU (kernel %.1f ms, "
                         "%llu page faults in large copies) (%.2f GB/s per thread)\n",
                         (copy_bytes - last_copy_bytes) / 1e6, (copy_ns - last_copy_ns) / 1e6,
@@ -924,6 +931,15 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            if (const u64 omitted = BbStats::image_snapshot_omitted_bytes.exchange(0)) {
+                std::printf("Texture staging: skipped %.1f MB of unused mip uploads "
+                            "(%.2f MB/frame)\n", omitted / 1e6, omitted / (1e6 * frames));
+            }
+            if (slow_frames > stall_samples) {
+                std::printf("Stall diagnostics: %u of %u slow frames sampled (>40 ms)\n",
+                            stall_samples, slow_frames);
+            }
+            slow_frames = stall_samples = 0;
             VideoCore::PageManager::ReportFaultSites();
             if (const u64 notes = BbStats::cpu_write_notes.exchange(0)) {
                 std::printf("Write notices: %.0f/s, %.2f MB/s (libc copies over pages the GPU side "

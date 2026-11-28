@@ -7,7 +7,10 @@
 namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
-    ctx.Decorate(op, spv::Decoration::NoContraction);
+    // bbport: with BB_FAST_MATH we drop NoContraction so the driver may contract mul+add into FMA.
+    if (!ctx.profile.fast_shader_math) {
+        ctx.Decorate(op, spv::Decoration::NoContraction);
+    }
     return op;
 }
 

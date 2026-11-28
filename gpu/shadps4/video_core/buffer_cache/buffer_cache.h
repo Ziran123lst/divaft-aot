@@ -172,8 +172,10 @@ public:
     /// copies, shared blocks are never queued or returned), arenas bound sparsely.
     [[nodiscard]] bool CopyQueueActive() const;
 
-    /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// Obtain image data. The caller may offer a prefix to omit only when taking a CPU staging
+    /// snapshot; `omitted_prefix` reports how much was actually omitted (zero on all other paths).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size,
+                                                                      u32& omitted_prefix);
 
     /// bbport BB_UMA: a CPU snapshot of [device_addr, device_addr + size) in staging, taken now (what copy
     /// mode reads at record time): for sources that must not be read live out of shared memory.

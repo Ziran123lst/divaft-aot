@@ -224,6 +224,14 @@ typedef struct {
     uint32_t mode;        /* 52: SaveDataDialogMode (1=LIST ... 5=PROGRESS_BAR) */
     uint32_t dispType;    /* 56: DialogType (1=SAVE 2=LOAD 3=DELETE) */
     int32_t  pad;         /* 60 */
+    void *animParam;      /* 64 */
+    void *items;          /* 72 */
+    void *userMsgParam;   /* 80 */
+    void *sysMsgParam;    /* 88 */
+    void *errorCodeParam; /* 96: ErrorCodeParam* { u32 errorCode; ... } */
+    void *progressBarParam;/*104 */
+    void *userData;       /* 112: echoed back in GetResult */
+    void *optionParam;    /* 120 */
 } SdlgParam;
 typedef struct {
     uint32_t mode;        /* 0  */
@@ -238,6 +246,7 @@ typedef struct {
 static uint32_t sdlg_mode=1, sdlg_disp=2;
 static char sdlg_chosen[64]="SAVEDATA00";
 static int  sdlg_interactive=0;
+static void *sdlg_userdata=NULL;   /* echoed back to guest in GetResult */
 static unsigned long sdlg_seq=0; /* monotonic request id; response must echo it */
 
 /* Directory holding the dialog bridge files. Empty => bridge disabled (auto-answer). */
@@ -286,8 +295,14 @@ static void savedlg_scan_slots(char *out,size_t outsz) {
             struct dirent *se;
             while ((se=readdir(slots))) {
                 if (strncmp(se->d_name,"SAVEDATA",8)) continue;
+                /* Only real slot dirs (SAVEDATA00, SAVEDATA01, ...). The
+                 * "<slot>.sce_sys" metadata dirs are NOT selectable slots;
+                 * offering them lets the player pick a bogus entry which the
+                 * game then fails to load and drops back to the menu. */
+                size_t nlen=strlen(se->d_name);
+                if (nlen>8 && !strcmp(se->d_name+nlen-8,".sce_sys")) continue;
                 if (used && used+1<outsz) { out[used++]=';'; }
-                size_t len=strlen(se->d_name);
+                size_t len=nlen;
                 if (used+len>=outsz) break;
                 memcpy(out+used,se->d_name,len); used+=len; out[used]=0;
             }
@@ -299,12 +314,98 @@ static void savedlg_scan_slots(char *out,size_t outsz) {
     printf("Runtime: SaveDataDialog slots found: [%s]\n",out);
 }
 
+/* shadPS4 semantics (savedatadialog.cpp): Open -> RUNNING; the UI's Finish()
+ * sets status FINISHED as soon as the player picks; GetResult() only COPIES the
+ * cached result and never blocks.  The game polls GetStatus()/UpdateStatus()
+ * and calls GetResult() only once status==FINISHED.  Our previous build flipped
+ * status to FINISHED inside GetResult(), so a game that waits for FINISHED before
+ * calling GetResult() deadlocked forever on a black dialog (the player's click
+ * wrote `response`, but nothing ever consumed it).  Fix: pump the response from
+ * every status query exactly the way shadPS4's UI thread pumps Finish(). */
+static int  sdlg_result_ready=0;   /* response consumed, result cached */
+static int  sdlg_cancelled=0;
+static unsigned long sdlg_open_ms=0; /* for timeout fallback */
+
+/* Consume a matching response if present. Returns 1 when the dialog just became
+ * FINISHED. Safe to call repeatedly (idempotent once result_ready is set). */
+static int savedlg_pump(void) {
+    if (dialogs[2].status!=2 || !sdlg_interactive || sdlg_result_ready) return 0;
+    const char *dir=savedlg_dir();
+    if (!dir) return 0;
+    char resp[512];
+    savedlg_path(dir,"response",resp,sizeof(resp));
+    FILE *f=fopen(resp,"r");
+    if (!f) return 0;
+    char line[128]={0};
+    if (fgets(line,sizeof(line),f)) {
+        line[strcspn(line,"\r\n")]=0;
+        unsigned long rseq=strtoul(line,NULL,10);
+        const char *val=line;
+        while (*val && *val!=' ' && *val!='\t') val++;
+        while (*val==' ' || *val=='\t') val++;
+        if (rseq==sdlg_seq && *val) {
+            sdlg_cancelled=0;
+            if (!strcmp(val,"CANCEL")) sdlg_cancelled=1;
+            else if (!strcmp(val,"NEW")) snprintf(sdlg_chosen,sizeof(sdlg_chosen),"SAVEDATA00");
+            else if (strlen(val)<sizeof(sdlg_chosen)) snprintf(sdlg_chosen,sizeof(sdlg_chosen),"%s",val);
+            sdlg_result_ready=1;
+            dialogs[2].status=3; /* FINISHED */
+            printf("Runtime: SaveDataDialog selection seq=%lu -> [%s]%s (pump)\n",
+                   rseq,sdlg_chosen,sdlg_cancelled?" (CANCEL)":"");
+        } else {
+            printf("Runtime: SaveDataDialog ignoring stale response (seq=%lu want=%lu)\n",rseq,sdlg_seq);
+        }
+    }
+    fclose(f);
+    unlink(resp); /* consume this response either way */
+    return sdlg_result_ready;
+}
+
 static ABI int32_t save_init(void) { return dialog_init(2); }
-static ABI int32_t save_status(void) { return dialog_status(2); }
-static ABI int32_t save_term(void) { return dialog_term(2); }
+static ABI int32_t save_status(void) {
+    savedlg_pump();
+    return dialog_status(2);
+}
+static ABI int32_t save_term(void) { sdlg_result_ready=0; return dialog_term(2); }
 static ABI int32_t save_open(const SdlgParam *p) {
-    if (p) { sdlg_mode=p->mode; sdlg_disp=p->dispType; }
+    if (p) {
+        sdlg_mode=p->mode; sdlg_disp=p->dispType;
+        sdlg_userdata=p->userData;
+        /* ERROR_CODE (mode=4) carries the reason the game failed to load its
+         * save. Log it so a report can tell a corrupt/empty save from a benign
+         * informational dialog. */
+        if (sdlg_mode==4 && p->errorCodeParam) {
+            printf("Runtime: SaveDataDialog ERROR_CODE errorCode=0x%x (userData=%p)\n",
+                   *(const uint32_t*)p->errorCodeParam, p->userData);
+        }
+    }
     sdlg_interactive=0;
+    sdlg_result_ready=0;
+    sdlg_cancelled=0;
+    sdlg_open_ms=(unsigned long)(time(NULL)*1000);
+
+    /* Only mode=1 (LIST) asks the player to pick a slot. The other modes are
+     * purely informational and must NOT pop the slot picker:
+     *   2=USER_MSG, 3=SYSTEM_MSG, 4=ERROR_CODE, 5=PROGRESS_BAR.
+     * A save/load sequence is LIST -> PROGRESS_BAR(5) -> ERROR_CODE(4); the game
+     * only polls status and never calls GetResult for 5/4. Previously we popped
+     * a picker for all of them, forcing the player to click three times and
+     * sometimes hit CANCEL, which the game read as an aborted load -> menu.
+     * Auto-finish these with OK, keeping the slot selected in the LIST step. */
+    if (sdlg_mode != 1) {
+        const char *d0=savedlg_dir();
+        if (d0) {
+            char stale[512];
+            savedlg_path(d0,"response",stale,sizeof(stale));
+            unlink(stale); /* ignore any late click from the previous dialog */
+        }
+        sdlg_result_ready=1;
+        dialogs[2].status=3; /* FINISHED */
+        printf("Runtime: SaveDataDialog auto-finish info mode=%u (no picker; slot=%s)\n",
+               sdlg_mode,sdlg_chosen);
+        return 0;
+    }
+
     const char *dir=savedlg_dir();
     if (dir) {
         char req[512],resp[512];
@@ -329,64 +430,35 @@ static ABI int32_t save_open(const SdlgParam *p) {
     return dialog_open(2); /* no bridge: legacy immediate completion */
 }
 static ABI int32_t save_get_result(SdlgResult *r) {
-    if (dialogs[2].status!=2 && dialogs[2].status!=3) return (int32_t)0x80B80005; /* NOT_FINISHED */
+    /* Never block here. Pump once for the case the game calls GetResult while
+     * still RUNNING, then report the real status (shadPS4: NOT_FINISHED). */
+    savedlg_pump();
+    if (dialogs[2].status!=3) return (int32_t)0x80B80005; /* NOT_FINISHED */
     if (!r) return (int32_t)0x80B8000D;                     /* ARG_NULL */
-    char chosen[64]="SAVEDATA00";
-    uint32_t button=1; /* OK */
-    int cancelled=0;
-    if (sdlg_interactive) {
-        const char *dir=savedlg_dir();
-        char resp[512];
-        savedlg_path(dir,"response",resp,sizeof(resp));
-        unsigned timeout=300;
-        const char *t=getenv("BB_SAVEDLG_TIMEOUT");
-        if (t && t[0]) timeout=(unsigned)strtoul(t,NULL,10);
-        unsigned waited=0;
-        int got=0;
-        while (waited<timeout && !got) {
-            FILE *f=fopen(resp,"r");
-            if (f) {
-                char line[128]={0};
-                if (fgets(line,sizeof(line),f)) {
-                    line[strcspn(line,"\r\n")]=0;
-                    unsigned long rseq=strtoul(line,NULL,10);
-                    const char *val=line;
-                    while (*val && *val!=' ' && *val!='\t') val++;
-                    while (*val==' ' || *val=='\t') val++;
-                    if (rseq==sdlg_seq && *val) {
-                        got=1;
-                        if (!strcmp(val,"CANCEL")) cancelled=1;
-                        else if (!strcmp(val,"NEW")) snprintf(chosen,sizeof(chosen),"SAVEDATA00");
-                        else if (strlen(val)<sizeof(chosen)) snprintf(chosen,sizeof(chosen),"%s",val);
-                        printf("Runtime: SaveDataDialog selection seq=%lu -> [%s]%s\n",
-                               rseq,chosen,cancelled?" (CANCEL)":"");
-                    } else {
-                        printf("Runtime: SaveDataDialog ignoring stale response (seq=%lu want=%lu)\n",rseq,sdlg_seq);
-                    }
-                }
-                fclose(f);
-                unlink(resp); /* consume this response either way */
-                if (!got) { usleep(100000); waited++; }
-            } else {
-                usleep(100000); /* 100 ms */
-                waited++;
-            }
-        }
-        if (!got) printf("Runtime: SaveDataDialog timed out after %us; auto-answering SAVEDATA00\n",timeout);
-    }
-    snprintf(sdlg_chosen,sizeof(sdlg_chosen),"%s",chosen);
-    dialogs[2].status=3; /* FINISHED */
     memset(r,0,sizeof(*r));
     r->mode=sdlg_mode ? sdlg_mode : 1;
     r->result=0;    /* OK */
-    r->buttonId=cancelled ? 2 : button; /* NO on cancel, OK otherwise */
+    r->buttonId=sdlg_cancelled ? 2 : 1; /* NO on cancel, OK otherwise */
+    r->userData=sdlg_userdata; /* shadPS4 CopyTo echoes userData; games key off it */
     if (r->dirName) memcpy(r->dirName,sdlg_chosen,strlen(sdlg_chosen)+1);
-    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=%s (ui=%d)\n",
-           sdlg_mode,sdlg_disp,sdlg_chosen,sdlg_interactive);
+    printf("Runtime: SaveDataDialog GetResult -> mode=%u disp=%u slot=%s (ui=%d ready=%d userData=%p)\n",
+           sdlg_mode,sdlg_disp,sdlg_chosen,sdlg_interactive,sdlg_result_ready,sdlg_userdata);
     return 0;
 }
-static ABI int32_t save_is_ready(void) { return dialogs[2].status==3 ? 1 : 0; }
-static ABI int32_t save_close(void) { if (dialogs[2].status==2) { dialogs[2].status=3; } return 0; }
+static ABI int32_t save_is_ready(void) {
+    savedlg_pump();
+    return dialogs[2].status==3 ? 1 : 0;
+}
+static ABI int32_t save_close(void) {
+    savedlg_pump();
+    if (dialogs[2].status==2) { /* cancelled/closed without a pick */
+        sdlg_result_ready=1;
+        sdlg_cancelled=1;
+        snprintf(sdlg_chosen,sizeof(sdlg_chosen),"SAVEDATA00");
+        dialogs[2].status=3;
+    }
+    return 0;
+}
 static ABI int32_t save_progress_set(void *t,uint32_t v) { (void)t;(void)v;return 0; }
 static ABI int32_t save_progress_inc(void *t,uint32_t d) { (void)t;(void)d;return 0; }
 static ABI int32_t common_is_used(void) { return dialogs[1].initialized || dialogs[2].initialized; }

@@ -138,6 +138,8 @@ inline std::atomic<std::uint32_t> hot_epoch{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};
+/// Guest bytes not copied into CPU staging because their mip levels are already unused.
+inline std::atomic<std::uint64_t> image_snapshot_omitted_bytes{0};
 inline std::atomic<std::uint64_t> buffer_upload_bytes{0};
 inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command thread
 inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};

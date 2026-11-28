@@ -1168,21 +1168,28 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
-    const auto [in_buffer, in_offset] =
-        buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    // The guest's whole description (texture quality: `info` may leave its largest levels out):
-    // those levels are not detiled, nor read over the bus (BB_DETILE_SKIPPED=1: they are). The
-    // staging copy then starts at the first level detiled.
+    // Texture quality already skips detiling the largest mips. When the source is a CPU
+    // snapshot, skip staging those bytes too. Leave linear textures on their existing path.
     static const bool detile_skipped = [] {
         const char* env = std::getenv("BB_DETILE_SKIPPED");
         return env && env[0] == '1';
     }();
+    static const bool trim_mip_upload = [] {
+        const char* env = std::getenv("BB_MIP_UPLOAD_TRIM");
+        return !(env && env[0] == '0');
+    }();
     const u32 guest_first = detile_skipped ? 0u : u32(image.info.skip_levels);
-    const auto [buffer, offset] =
-        tile_manager.DetileImage(in_buffer, in_offset, image.guest_info, guest_first);
-    const u64 skipped = image.guest_info.props.is_tiled && guest_first != 0
+    const u32 skipped = image.guest_info.props.is_tiled && guest_first != 0
                             ? image.guest_info.mips_layout[guest_first].offset
                             : 0;
+    u32 omitted_prefix = trim_mip_upload ? skipped : 0;
+    const auto [in_buffer, in_offset] = buffer_cache.ObtainBufferForImage(
+        image.info.guest_address, image.info.guest_size, omitted_prefix);
+    if (omitted_prefix && BbStats::enabled) {
+        BbStats::image_snapshot_omitted_bytes.fetch_add(omitted_prefix, std::memory_order_relaxed);
+    }
+    const auto [buffer, offset] = tile_manager.DetileImage(
+        in_buffer, in_offset, image.guest_info, guest_first, omitted_prefix);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
         copy.bufferOffset -= skipped;

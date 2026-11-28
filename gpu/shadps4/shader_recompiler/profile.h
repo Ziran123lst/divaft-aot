@@ -14,6 +14,9 @@ struct Profile {
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
     u32 sparse_page_shift{};
+    // bbport: BB_FAST_MATH=1 relaxes float rules (allow FMA contraction, drop signed-zero/Inf/NaN
+    // preserve) to cut SPIR-V instruction count. Off by default; opt-in per launch env.
+    bool fast_shader_math{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};

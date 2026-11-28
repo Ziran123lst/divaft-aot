@@ -423,6 +423,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // bbport: another aspect ratio than 16:9 (part of the profile the shader cache is checked against).
         .ui_edge_stretch = BbDisplay::NonNative(),
     };
+    // bbport: relaxed float math is ON by default in this perf build (drop NoContraction and
+    // signed-zero/Inf/NaN preserve to cut SPIR-V instruction count). Set BB_FAST_MATH=0 to opt
+    // out. Set after init to keep the designated initializer above in field order. Printed so a
+    // log capture proves which path is active.
+    profile.fast_shader_math = true;
+    if (const char* env = std::getenv("BB_FAST_MATH")) {
+        profile.fast_shader_math = env[0] != '0';
+    }
+    std::printf("Shader float mode: %s (BB_FAST_MATH=0 to use strict NoContraction/Inf-NaN preserve)\n",
+                profile.fast_shader_math ? "fast" : "strict");
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});

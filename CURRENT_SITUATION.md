@@ -118,11 +118,26 @@ Frame stats 铁证：
 
 ---
 
+## 2026-11-28 追加：v8.0 性能优化（PerfTrim）
+
+基于实机日志的确定性优化，只替换 `libbbgpu.so`（dex/manifest/资源/游戏数据全部字节级不变，签名一致可覆盖安装）：
+
+1. **跳过无用 mip 的 staging 拷贝**（`BB_MIP_UPLOAD_TRIM`，默认开）：日志显示 `Texture quality: quarter` 已抛弃大 mip、detiling 也跳过了它们，但 CPU 做 staging 快照时仍把这些字节整个拷贝（每帧 41.8 MB 图像上传）。改为从第一级有效 mip 开始拷贝，detiling 输入偏移同步调整。只对 CPU 快照路径生效，GPU 原地读路径不变。
+2. **收敛慢帧诊断输出**（`BB_STALL_VERBOSE`，默认关）：旧逻辑每帧 >40 ms 就打约 10 行到 stdout，21 fps 重场景几乎每帧触发，Java 逐行读造成持续 I/O。改为同场景只采样前 3 次慢帧。
+
+**诚实的预期**：这是低风险的冗余消除，不承诺帧率数字。该场景主瓶颈是每帧 41.8 MB 纹理上传 + GPU 命令等待，非单一开关可解；若纹理质量为 `full` 则优化 1 不生效。是否真有收益需实机验证（当前沙箱无设备连接，未能实测）。
+
+**未混入**：`runtime_services.c`/`runtime_savedata.c` 的存档对话框 UI 改动（之前会话遗留、未测试）本次不编入 v8 的 so；仅作为源码状态同步提交，保持仓库与工作区构建源一致。
+
+验证钩子：日志新增 `Texture staging: skipped ... MB of unused mip uploads` 与 `Stall diagnostics: A of B slow frames sampled` 两行。
+
 ## 交付物索引
 
 | 文件 | 说明 |
 |---|---|
-| `releases/DIVA-Launcher-v7.0-AudioFix.apk` | 最新 APK（音频修复尝试，基于 v6.0） |
+| `releases/DIVA-Launcher-v8.0-PerfTrim.apk` | 最新 APK（性能优化，仅替换 libbbgpu.so，基于 v7.0） |
+| `releases/README-v8.0-PerfTrim.md` | v8.0 优化依据、内容与验证方式 |
+| `releases/DIVA-Launcher-v7.0-AudioFix.apk` | 音频修复尝试，基于 v6.0 |
 | `releases/DIVA-Launcher-v6.0-FastMath.apk` | fast shader math 性能版 |
 | `releases/DIVA-Launcher-v5.0-StableBase.apk` | 稳定基准（=v3.7） |
 | `releases/README-v6.0-FastMath.md` / `README-v7.0-AudioFix.md` | 各版本说明 |
