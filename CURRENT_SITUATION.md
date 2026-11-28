@@ -135,7 +135,9 @@ Frame stats 铁证：
 
 | 文件 | 说明 |
 |---|---|
-| `releases/DIVA-Launcher-v8.0-PerfTrim.apk` | 最新 APK（性能优化，仅替换 libbbgpu.so，基于 v7.0） |
+| `releases/DIVA-Launcher-v9.0-AllOpt.apk` | **最新 APK**（全优化合并：nested-IB draw-prep + mip-trim + stall + fast-math，仅替换 libbbgpu.so） |
+| `releases/README-v9.0-AllOpt.md` | v9.0 全优化说明 |
+| `releases/DIVA-Launcher-v8.0-PerfTrim.apk` | 性能优化尝试（mip-trim + stall），仅替换 libbbgpu.so |
 | `releases/README-v8.0-PerfTrim.md` | v8.0 优化依据、内容与验证方式 |
 | `releases/DIVA-Launcher-v7.0-AudioFix.apk` | 音频修复尝试，基于 v6.0 |
 | `releases/DIVA-Launcher-v6.0-FastMath.apk` | fast shader math 性能版 |
