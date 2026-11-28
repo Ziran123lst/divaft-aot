@@ -135,7 +135,9 @@ Frame stats 铁证：
 
 | 文件 | 说明 |
 |---|---|
-| `releases/DIVA-Launcher-v9.0-AllOpt.apk` | **最新 APK**（全优化合并：nested-IB draw-prep + mip-trim + stall + fast-math，仅替换 libbbgpu.so） |
+| `releases/DIVA-Launcher-v9.1-LinkFix.apk` | **最新 APK**（v9.1 + `__hash_memory` 链接符号补丁，需卸载旧版重装） |
+| `releases/README-v9.1-LinkFix.md` | v9.1 链接错误修复说明 |
+| `releases/DIVA-Launcher-v9.0-AllOpt.apk` | 全优化合并版：nested-IB draw-prep + mip-trim + stall + fast-math |
 | `releases/README-v9.0-AllOpt.md` | v9.0 全优化说明 |
 | `releases/DIVA-Launcher-v8.0-PerfTrim.apk` | 性能优化尝试（mip-trim + stall），仅替换 libbbgpu.so |
 | `releases/README-v8.0-PerfTrim.md` | v8.0 优化依据、内容与验证方式 |
