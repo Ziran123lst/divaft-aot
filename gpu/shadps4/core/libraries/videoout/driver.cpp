@@ -18,6 +18,7 @@
 #include "bbport_tex_home.h"
 #include "bbport_adpf.h"
 #include "bbport_toggles.h"
+#include "bbport_settings.h"
 #include "bbport_guest_memory.h"
 #include "bbport_uma.h"
 #include "bbport_fault.h"
@@ -931,6 +932,20 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            // bbport: report the ACTUAL scene render resolution and upscaler state so a log
+            // capture proves whether internal downscaling is active (1920x1080 + none = the
+            // game is rendering full-res and no upscaler can help FPS).
+            {
+                const auto& s = BbSettings::Get();
+                std::printf("Render scale: upscaler=%s preset=%d scene=%dx%d output=%dx%d "
+                            "(if upscaler=none or scene=1920x1080, FPS is limited by full-res render)\n",
+                            BbSettings::UpscalerName(s.upscaler.load()), BbSettings::RenderPreset(),
+                            s.active_render_width.load(), s.active_render_height.load(),
+                            s.output_res.load() >= 0 && s.output_res.load() < BbSettings::OutputCount
+                                ? BbSettings::OutputWidths[s.output_res.load()] : 0u,
+                            s.output_res.load() >= 0 && s.output_res.load() < BbSettings::OutputCount
+                                ? BbSettings::OutputHeights[s.output_res.load()] : 0u);
+            }
             if (const u64 omitted = BbStats::image_snapshot_omitted_bytes.exchange(0)) {
                 std::printf("Texture staging: skipped %.1f MB of unused mip uploads "
                             "(%.2f MB/frame)\n", omitted / 1e6, omitted / (1e6 * frames));

@@ -135,7 +135,9 @@ Frame stats 铁证：
 
 | 文件 | 说明 |
 |---|---|
-| `releases/DIVA-Launcher-v9.1-LinkFix.apk` | **最新 APK**（v9.1 + `__hash_memory` 链接符号补丁，需卸载旧版重装） |
+| `releases/DIVA-Launcher-v10-Diag.apk` | **最新 APK**（分辨率诊断版：打印实际 upscaler/preset/scene 分辨率；仅加诊断，需卸载重装并回传日志） |
+| `releases/README-v10-Diag.md` | v10 诊断目的与操作 |
+| `releases/DIVA-Launcher-v9.1-LinkFix.apk` | v9.1 + `__hash_memory` 链接符号补丁 |
 | `releases/README-v9.1-LinkFix.md` | v9.1 链接错误修复说明 |
 | `releases/DIVA-Launcher-v9.0-AllOpt.apk` | 全优化合并版：nested-IB draw-prep + mip-trim + stall + fast-math |
 | `releases/README-v9.0-AllOpt.md` | v9.0 全优化说明 |
