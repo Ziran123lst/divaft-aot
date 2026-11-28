@@ -1419,12 +1419,14 @@ bool Liverpool::PredicationSkips(const PM4Header* header) {
 }
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
-                                           u64 seq, std::shared_ptr<SubmittedCopy> copy) {
+                                           u64 seq, std::shared_ptr<SubmittedCopy> copy,
+                                           bool nested_ib) {
     FIBER_ENTER(dcb_task_name);
-    // Top-level buffers enqueued for the draw preparation workers (nested IBs are not).
+    // Top-level buffers bracket a submission for the draw-preparation workers; nested IBs
+    // take part too (their draws consume the prepared draws of the same submission).
     Vulkan::DrawPreparation* draw_prep =
-        seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
-    if (draw_prep) {
+        (seq != NoSeq || nested_ib) && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
+    if (draw_prep && seq != NoSeq) {
         draw_prep->BeginSubmission(seq, regs, gfx_reg_checksum);
     }
     static const bool dcb_stats = EmulatorSettingsImpl::Flag("BB_DCB_STATS", false);
@@ -2244,7 +2246,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {},
+                    NoSeq, {}, true);
                 // Tasks start suspended: the nested body (and its scan) runs on this resume.
                 g_dcb_depth = dcb_depth + 1;
                 RESUME_GFX(task);
@@ -2349,7 +2352,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (rasterizer && seq != NoSeq) {
         rasterizer->RetireSubmission(); // prepared draws live until the recording thread is past
     }
-    if (draw_prep) {
+    if (draw_prep && seq != NoSeq) {
         draw_prep->EndSubmission();
     }
     if (rasterizer && seq != NoSeq) {

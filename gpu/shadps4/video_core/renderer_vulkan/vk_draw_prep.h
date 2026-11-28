@@ -86,6 +86,17 @@ struct PreparedDraw {
     PreparedVertexInputs vertex{};
 };
 
+/// bbport: why a prepared draw could not be used (PipelineCache::TryPreparedPipeline),
+/// printed with the draw-preparation stats (BB_FRAME_STATS).
+enum class PreparedMiss : u32 {
+    NotReady = 0, ///< still Pending when the GPU thread reached the draw (workers late)
+    Unavailable,  ///< the worker gave up on it (unsupported state, stale sharp, ...)
+    Checksum,     ///< register checksum diverged (state the workers cannot reproduce)
+    Stale,        ///< program or flattened user data changed since the worker read it
+    _Count
+};
+void NotePreparedMiss(PreparedMiss reason);
+
 class DrawPreparation {
 public:
     explicit DrawPreparation(PipelineCache& pipeline_cache);
@@ -161,6 +172,7 @@ public:
 private:
     u32 current_draw = 0;
     u64 used = 0, unused = 0;
+    std::atomic<u64> ib_submissions{0}; ///< submissions containing a nested IB (5 s window)
     u32 worker_count = 0; ///< fixed before the worker threads start
     std::jthread scanner;
     std::vector<std::jthread> workers;
